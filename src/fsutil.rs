@@ -131,18 +131,14 @@ pub fn walk_stat(path: &Path, acct: &mut Reclaim, skip: &dyn Fn(&Path) -> bool) 
     }
 }
 
-/// Newest mtime of any file under `path` (0 if empty or unreadable).
-pub fn newest_mtime(path: &Path) -> i64 {
-    let mut newest = 0i64;
-    for entry in WalkDir::new(path).follow_links(false).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_dir() {
-            continue;
-        }
-        if let Some(m) = lmeta(entry.path()) {
-            newest = newest.max(m.mtime);
-        }
-    }
-    newest
+/// Newest mtime among a directory's immediate children -- enough to date a
+/// rustc session dir without walking gigabytes of session contents.
+pub fn newest_child_mtime(path: &Path) -> i64 {
+    let Ok(rd) = std::fs::read_dir(path) else { return 0 };
+    rd.flatten()
+        .filter_map(|e| lmeta(&e.path()).map(|m| m.mtime))
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn human(n: u64) -> String {

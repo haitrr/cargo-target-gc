@@ -22,35 +22,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 use collect::{Category, Claims, Options};
 use fsutil::{human, walk_stat, Reclaim};
 
 const AFTER_HELP: &str = "\
-TIERS
-  A  free                        orphaned units, dead fingerprints, abandoned and
-                                 superseded rustc sessions, .dSYM, doc/tmp/package,
-                                 and units built from dependency versions Cargo.lock
-                                 no longer resolves to. This is what --apply deletes.
-  B  recompile unmarked configs  unit variants from feature/profile/RUSTFLAGS configs
-                                 you no longer build. Needs `mark` first, then --sweep.
-  C  first-edit penalty          incremental/ caches. Opt in with --incremental.
+HOW IT DECIDES
+  Everything under target/ is either reachable from a build you run, or it is
+  garbage cargo will never collect. There is no timestamp that tells the two
+  apart — cargo does not touch a unit when it comes back Fresh, so mtime records
+  when a unit was last COMPILED, not when it was last USED. So this asks cargo
+  directly: it runs your build (a no-op if the tree is warm), records the units
+  that build resolves to, and deletes the rest.
 
-WHY NOT SWEEP BY MTIME
-  Cargo does not touch a unit's files when it comes back Fresh, so mtime records
-  when a unit was last COMPILED, not when it was last USED — and the units you
-  rebuild least are exactly your stable ones. A cutoff sweep deletes the live set
-  and keeps the garbage. That is why tier B asks cargo instead of guessing.
+  Name every config you actually use, or the ones you leave out get deleted and
+  cold-rebuild the next time you switch to them:
+
+    cargo target-gc --apply --build 'cargo build' --build 'cargo clippy --all-targets'
+
+WHAT IT DELETES
+  unit variants     every unit no named build resolves to
+  incremental/      all but the newest --keep-incremental dirs per crate; rustc
+                    never removes these itself, so they grow without bound
+  free leftovers    orphaned units, dead fingerprints, abandoned rustc sessions,
+                    .dSYM, doc/tmp/package, and units built from dependency
+                    versions Cargo.lock no longer resolves to
 
 EXAMPLES
-  cargo target-gc                              report only, changes nothing
-  cargo target-gc --apply                      delete the free tier
-  cargo target-gc --incremental all --apply    also drop incremental caches
-  cargo target-gc mark -- cargo build          record what today's build uses
-  cargo target-gc mark -- cargo test --no-run  ...marks accumulate across runs
-  cargo target-gc --sweep --apply              delete every unmarked unit variant
-  cargo target-gc --budget 20G --apply         free cheapest-first until it fits
+  cargo target-gc                       report what would go, delete nothing
+  cargo target-gc --apply               delete it
+  cargo target-gc --no-build            report without running any build
+  cargo target-gc --budget 20G --apply  free cheapest-first until target/ fits
 ";
 
 #[derive(Parser)]
@@ -75,13 +78,17 @@ struct Cli {
     #[arg(long)]
     apply: bool,
 
-    /// Also collect unit variants no mark covers (tier B); requires a prior `mark`
-    #[arg(long)]
-    sweep: bool,
+    /// A build whose units to keep, repeatable [default: cargo build --all-targets]
+    #[arg(long, value_name = "CMD")]
+    build: Vec<String>,
 
-    /// Also collect rustc incremental caches (tier C) [default when bare: stale:14]
-    #[arg(long, value_name = "all|stale:DAYS", num_args = 0..=1, default_missing_value = "stale:14")]
-    incremental: Option<String>,
+    /// Do not run any build: report and collect only what needs no live set
+    #[arg(long, conflicts_with = "build")]
+    no_build: bool,
+
+    /// Incremental cache dirs to keep per crate, or `all` to keep every one
+    #[arg(long, value_name = "N|all", default_value = "2")]
+    keep_incremental: String,
 
     /// Collect cheapest-first only until target/ fits in SIZE (e.g. 20G)
     #[arg(long, value_name = "SIZE")]
@@ -90,21 +97,6 @@ struct Cli {
     /// Machine-readable summary
     #[arg(long)]
     json: bool,
-
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Record the unit hashes a real build resolves to (the tier B oracle)
-    Mark {
-        /// Build command to run; defaults to `cargo build`
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "CMD")]
-        command: Vec<String>,
-    },
-    /// Show what the current mark file covers
-    Marks,
 }
 
 fn main() {
@@ -137,56 +129,47 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    match &cli.cmd {
-        Some(Cmd::Marks) => {
-            let live = marks::load(&target_dir);
-            println!(
-                "{} live unit hashes in {}",
-                live.len(),
-                marks::mark_path(&target_dir).display()
-            );
-            if live.is_empty() {
-                println!("run `cargo target-gc mark -- cargo build` before --sweep");
-            }
-            return Ok(());
-        }
-        Some(Cmd::Mark { command }) => {
-            let cmd = if command.is_empty() {
-                vec!["cargo".to_string(), "build".to_string()]
-            } else {
-                command.clone()
-            };
-            let live = marks::mark(&target_dir, &[cmd], cli.json)?;
-            eprintln!(
-                "marked {} live unit hashes in {}",
-                live.len(),
-                marks::mark_path(&target_dir).display()
-            );
-            // Marking alone changes nothing unless a collection was also asked for.
-            if !cli.sweep && !cli.apply && cli.budget.is_none() {
-                return Ok(());
-            }
-        }
-        None => {}
-    }
-
-    let live = if cli.sweep {
-        let m = marks::load(&target_dir);
-        if m.is_empty() {
-            bail!("--sweep needs marks first: run `cargo target-gc mark -- <the build you use>`");
-        }
-        Some(m)
-    } else {
-        None
+    let keep_incremental = match cli.keep_incremental.as_str() {
+        "all" => None,
+        n => Some(
+            n.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("--keep-incremental takes a number or `all`"))?,
+        ),
     };
 
-    let incremental = match cli.incremental.as_deref() {
-        None => None,
-        Some("all") => Some(None),
-        Some(s) => match s.strip_prefix("stale:").and_then(|d| d.parse::<f64>().ok()) {
-            Some(days) => Some(Some(days)),
-            None => bail!("--incremental takes `all` or `stale:DAYS` (got {s:?})"),
-        },
+    // Ask cargo what is live. A warm tree makes this a freshness check; a cold
+    // one compiles, which is the same work the next build would have done.
+    let live = if cli.no_build {
+        let stored = marks::load(&target_dir);
+        if stored.is_empty() {
+            if !cli.json {
+                eprintln!(
+                    "note: --no-build and no live set on record, so unit variants are left \
+                     alone; run without --no-build to collect them"
+                );
+            }
+            None
+        } else {
+            if !cli.json {
+                eprintln!(
+                    "note: --no-build — reusing the live set from the last run ({} units); \
+                     anything built since is at risk",
+                    stored.len()
+                );
+            }
+            Some(stored)
+        }
+    } else {
+        let cmds: Vec<Vec<String>> = if cli.build.is_empty() {
+            vec![vec![
+                "cargo".into(),
+                "build".into(),
+                "--all-targets".into(),
+            ]]
+        } else {
+            cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect()
+        };
+        Some(marks::mark(&target_dir, &cmds, cli.json)?)
     };
 
     let lockpath = lockfile::find_lockfile(&target_dir);
@@ -200,7 +183,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let opts = Options {
         live: live.as_ref(),
-        incremental,
+        keep_incremental,
         locked: locked.as_ref(),
     };
 
@@ -268,11 +251,11 @@ fn run(cli: Cli) -> Result<()> {
                 kept.push(c);
             }
             let mut more: Vec<&str> = Vec::new();
-            if !cli.sweep {
-                more.push("--sweep");
+            if cli.no_build {
+                more.push("a run without --no-build");
             }
-            if cli.incremental.as_deref() != Some("all") {
-                more.push("--incremental all");
+            if keep_incremental.is_some_and(|k| k > 0) {
+                more.push("--keep-incremental 0");
             }
             let short = if got >= need {
                 String::new()

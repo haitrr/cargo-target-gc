@@ -246,7 +246,9 @@ impl DepsIndex {
 /// that config was not settled, and its artifacts are now marked either way.
 pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<Marks> {
     let idx = build_index(target_dir);
-    let mut marks = load(target_dir);
+    // Each run records the live set afresh: an accumulated mark from last week
+    // keeps units that are dead today, which is the whole problem being solved.
+    let mut marks = Marks::default();
     let now = crate::collect::now_secs();
 
     for cmd in commands {
@@ -301,8 +303,10 @@ pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<
         }
         let status = child.wait()?;
         if !status.success() {
-            eprintln!(
-                "  warning: `{}` exited {}; marks from it may be incomplete",
+            // Sweeping on a partial live set deletes units that are in use, so a
+            // failed build has to stop the run rather than narrow it.
+            anyhow::bail!(
+                "`{}` exited {} — not deleting anything, since its live set is incomplete",
                 cmd.join(" "),
                 status.code().map(|c| c.to_string()).unwrap_or_else(|| "by signal".into())
             );

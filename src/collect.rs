@@ -6,10 +6,10 @@
 //!      not `mark`.
 //!   C. `incremental/` -- costs the first-edit penalty, per crate, once.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::fsutil::{newest_mtime, walk_stat, Reclaim};
+use crate::fsutil::{newest_child_mtime, walk_stat, Reclaim};
 use crate::lockfile::{self, Locked};
 use crate::marks::Marks;
 use crate::scan::{find_profile_dirs, fingerprint_is_hashless_lib, hashless_lib_targets, scan_units};
@@ -34,6 +34,20 @@ fn session_kind(name: &str) -> Option<bool> {
         Some((id, tail)) if alnum(id) => Some(tail == "working"),
         None if alnum(b) => Some(false),
         _ => None,
+    }
+}
+
+/// The crate a rustc incremental dir belongs to: `oxy_app-1a2b3c4d5e6f7` minus
+/// the base-36 disambiguator rustc derives from the unit's `-C metadata`.
+fn incremental_crate_name(dir: &str) -> &str {
+    match dir.rfind('-') {
+        Some(i) => {
+            let suffix = &dir[i + 1..];
+            let disambiguator = suffix.len() >= 10
+                && suffix.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+            if disambiguator { &dir[..i] } else { dir }
+        }
+        None => dir,
     }
 }
 
@@ -97,8 +111,8 @@ impl Category {
 pub struct Options<'a> {
     /// `None` = tier B off; `Some` = sweep against these marks.
     pub live: Option<&'a Marks>,
-    /// `None` = tier C off, `Some(None)` = all, `Some(Some(days))` = stale only.
-    pub incremental: Option<Option<f64>>,
+    /// How many incremental crate dirs to keep per crate; `None` keeps them all.
+    pub keep_incremental: Option<usize>,
     pub locked: Option<&'a Locked>,
 }
 
@@ -258,19 +272,42 @@ pub fn collect(profile_dir: &Path, target_dir: &Path, opts: &Options, claims: &m
     }
 
     // --- tier C: costs the first-edit penalty, per crate, once ---------------
-    if let Some(window) = opts.incremental {
-        let cutoff = match window {
-            None => i64::MAX,
-            Some(days) => now_secs() - (days * 86400.0) as i64,
-        };
-        let blurb = match window {
-            None => "rustc incremental caches".to_string(),
-            Some(days) => format!("rustc incremental caches untouched {days}d"),
-        };
-        let mut incr = Category::new("incremental", 'C', 2.0, blurb);
+    //
+    // rustc garbage-collects sessions INSIDE a crate dir but never removes a
+    // crate dir: the dir is keyed by `-C metadata`, so every new config or
+    // revision of a crate starts a fresh one and orphans the old one forever.
+    // That is unbounded growth by construction -- 959 dirs for 55 crates on the
+    // tree this was measured against. Dropping one cannot cascade: cargo never
+    // consults incremental state for freshness, so the cost lands only when you
+    // next edit that crate, and only as one non-incremental compile of it.
+    if let Some(keep) = opts.keep_incremental {
+        let mut incr = Category::new(
+            "incremental",
+            'C',
+            2.0,
+            format!(
+                "rustc incremental caches beyond the newest {keep} per crate \
+                 (costs one non-incremental compile of a crate, when you next edit it)"
+            ),
+        );
+        let mut by_crate: HashMap<String, Vec<(i64, PathBuf)>> = HashMap::new();
         for cdir in &crate_dirs {
-            if newest_mtime(cdir) < cutoff {
-                incr.take(cdir, claims);
+            let name = cdir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            by_crate
+                .entry(incremental_crate_name(&name).to_string())
+                .or_default()
+                .push((newest_child_mtime(cdir), cdir.clone()));
+        }
+        let mut names: Vec<&String> = by_crate.keys().collect();
+        names.sort();
+        for name in names {
+            let mut dirs = by_crate[name].clone();
+            if dirs.len() <= keep {
+                continue;
+            }
+            dirs.sort();
+            for (_, path) in &dirs[..dirs.len() - keep] {
+                incr.take(path, claims);
             }
         }
         cats.push(incr);
@@ -314,6 +351,14 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::session_kind;
+
+    #[test]
+    fn incremental_names() {
+        assert_eq!(super::incremental_crate_name("oxy_app-1a2b3c4d5e6f7"), "oxy_app");
+        assert_eq!(super::incremental_crate_name("build_script_build-040ezm4u1l6ih"), "build_script_build");
+        // not a disambiguator: too short, and a crate may legitimately end in one
+        assert_eq!(super::incremental_crate_name("foo-bar"), "foo-bar");
+    }
 
     #[test]
     fn sessions() {
