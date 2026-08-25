@@ -1,0 +1,28 @@
+[package]
+name = "cargo-target-gc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Reclaim disk from a Rust workspace's target/ by rebuild cost, instead of cargo clean's all-or-nothing"
+license = "MIT OR Apache-2.0"
+keywords = ["cargo", "cargo-subcommand", "disk", "cleanup", "target"]
+categories = ["development-tools::cargo-plugins"]
+
+[[bin]]
+name = "cargo-target-gc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+strip = true
