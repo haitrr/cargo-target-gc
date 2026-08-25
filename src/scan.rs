@@ -105,6 +105,32 @@ pub fn hashless_lib_targets(profile_dir: &Path) -> HashSet<String> {
     out
 }
 
+/// True if this profile holds `cargo check` units.
+///
+/// A check unit emits metadata only, so it appears in `deps/` as
+/// `<name>-<hash>.rmeta` with no `.rlib`/`.dylib` beside it -- and it is a
+/// *different unit* from the build unit of the same crate, with its own hash.
+/// A build command therefore never resolves to one, so unless `cargo check` is
+/// named too, checking runs cold after a collection. (Proc-macro units emit a
+/// dylib, so they are not mistaken for check units.)
+pub fn has_check_units(profile_dir: &Path) -> bool {
+    let mut exts: HashMap<String, (bool, bool)> = HashMap::new();
+    let Ok(rd) = fs::read_dir(profile_dir.join("deps")) else { return false };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let st = stem(&name);
+        let Some(h) = unit_hash(st) else { continue };
+        let ext = name[st.len()..].trim_start_matches('.').to_string();
+        let entry = exts.entry(h.to_string()).or_insert((false, false));
+        match ext.as_str() {
+            "rmeta" => entry.0 = true,
+            "rlib" | "dylib" | "so" | "dll" | "a" | "lib" => entry.1 = true,
+            _ => {}
+        }
+    }
+    exts.values().any(|(rmeta, linked)| *rmeta && !*linked)
+}
+
 /// The lib target names a fingerprint dir is about.
 ///
 /// A fingerprint dir holds one file per output kind -- `lib-foo`, `bin-foo`,

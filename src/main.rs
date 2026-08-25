@@ -161,11 +161,18 @@ fn run(cli: Cli) -> Result<()> {
         }
     } else {
         let cmds: Vec<Vec<String>> = if cli.build.is_empty() {
-            vec![vec![
-                "cargo".into(),
-                "build".into(),
-                "--all-targets".into(),
-            ]]
+            let mut default = vec![vec!["cargo".into(), "build".into(), "--all-targets".into()]];
+            // Check units are separate units with their own hashes, so a build
+            // command never resolves to them. Naming `cargo check` only when the
+            // tree already has such units keeps the default from compiling
+            // metadata nobody asked for.
+            if profiles.iter().any(|p| scan::has_check_units(p)) {
+                if !cli.json {
+                    eprintln!("note: this tree has `cargo check` units, so they are marked too");
+                }
+                default.push(vec!["cargo".into(), "check".into(), "--all-targets".into()]);
+            }
+            default
         } else {
             cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect()
         };

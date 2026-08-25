@@ -40,8 +40,17 @@ cargo target-gc --apply \
 ```
 
 The default is `cargo build --all-targets`, which covers lib, bins, tests,
-examples and benches for your default features. Note that on a tree where tests
-were never built, that first run compiles them.
+examples and benches for your default features, plus `cargo check --all-targets`
+when the tree already contains check units. That second one matters: a check unit
+emits metadata only and is a *different unit* with its own hash, so a build
+command never resolves to one — without it, `cargo check` runs cold after a
+collection. It is only added when such units already exist, so the default never
+compiles metadata nobody asked for.
+
+Anything driven by another compiler front-end is invisible to both and needs
+naming explicitly — `--build 'cargo clippy --all-targets'`, and whatever your
+editor runs if it shares this target dir. Note that on a tree where tests were
+never built, the first run compiles them.
 
 Other flags: `--no-build` reports without running anything (and then only
 collects what needs no live set), `--keep-incremental N|all`, `--budget 20G`,
