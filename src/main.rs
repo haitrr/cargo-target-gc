@@ -36,6 +36,10 @@ HOW IT DECIDES
   directly: it runs your build (a no-op if the tree is warm), records the units
   that build resolves to, and deletes the rest.
 
+  The default build is narrowed to the target kinds this tree has already built,
+  read off .fingerprint/ — a kind you have never built has no units to sweep, so
+  compiling it would mark nothing.
+
   Name every config you actually use, or the ones you leave out get deleted and
   cold-rebuild the next time you switch to them:
 
@@ -51,7 +55,8 @@ WHAT IT DELETES
 
 EXAMPLES
   cargo target-gc                       report what would go, delete nothing
-  cargo target-gc --apply               delete it
+  cargo target-gc --apply               report, then ask before deleting
+  cargo target-gc --apply --yes         delete without asking (scripts, CI)
   cargo target-gc --no-build            report without running any build
   cargo target-gc --budget 20G --apply  free cheapest-first until target/ fits
 ";
@@ -78,7 +83,8 @@ struct Cli {
     #[arg(long)]
     apply: bool,
 
-    /// A build whose units to keep, repeatable [default: cargo build --all-targets]
+    /// A build whose units to keep, repeatable [default: cargo build, narrowed
+    /// to the target kinds this tree has already built]
     #[arg(long, value_name = "CMD")]
     build: Vec<String>,
 
@@ -93,6 +99,10 @@ struct Cli {
     /// Collect cheapest-first only until target/ fits in SIZE (e.g. 20G)
     #[arg(long, value_name = "SIZE")]
     budget: Option<String>,
+
+    /// Delete without the confirmation prompt (required for --apply off a terminal)
+    #[arg(long, short = 'y')]
+    yes: bool,
 
     /// Machine-readable summary
     #[arg(long)]
@@ -114,7 +124,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let target_dir = resolve_target_dir(&cli)?;
+    // One `cargo metadata`: it answers both where the target dir is and which
+    // targets this workspace declares, and the second answer is what keeps the
+    // mark commands from naming a target kind the manifest does not have.
+    let meta = cargo_metadata(&cli);
+    let target_dir = resolve_target_dir(&cli, meta.as_ref())?;
     if !target_dir.is_dir() {
         bail!("no target dir at {}", target_dir.display());
     }
@@ -161,7 +175,30 @@ fn run(cli: Cli) -> Result<()> {
         }
     } else {
         let cmds: Vec<Vec<String>> = if cli.build.is_empty() {
-            let mut default = vec![vec!["cargo".into(), "build".into(), "--all-targets".into()]];
+            // Only the target kinds this tree has actually built. `--all-targets`
+            // would compile the rest from cold to mark units that do not exist.
+            let declared = declared_targets(meta.as_ref());
+            let mut kinds: Vec<&'static str> = Vec::new();
+            for p in &profiles {
+                for k in scan::built_kinds(p, &declared) {
+                    if !kinds.contains(&k) {
+                        kinds.push(k);
+                    }
+                }
+            }
+            if kinds.is_empty() {
+                kinds.push("--all-targets");
+            } else if !cli.json {
+                eprintln!(
+                    "note: this tree has only built {}, so that is all the default marks compile",
+                    kinds.join(" ")
+                );
+            }
+            let sel = |mut c: Vec<String>| {
+                c.extend(kinds.iter().map(|k| k.to_string()));
+                c
+            };
+            let mut default = vec![sel(vec!["cargo".into(), "build".into()])];
             // Check units are separate units with their own hashes, so a build
             // command never resolves to them. Naming `cargo check` only when the
             // tree already has such units keeps the default from compiling
@@ -170,7 +207,7 @@ fn run(cli: Cli) -> Result<()> {
                 if !cli.json {
                     eprintln!("note: this tree has `cargo check` units, so they are marked too");
                 }
-                default.push(vec!["cargo".into(), "check".into(), "--all-targets".into()]);
+                default.push(sel(vec!["cargo".into(), "check".into()]));
             }
             default
         } else {
@@ -287,17 +324,99 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    let freed = delete(&cats, &target_dir, cli.apply)?;
-
+    // The report comes before the deletion, not after it: --apply is asking to
+    // destroy work, and the only way to judge it is to have read the table.
+    let mut apply = cli.apply && !cats.is_empty();
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&report::json_summary(&cats, &target_dir, cli.apply))?);
+        if apply && !cli.yes {
+            bail!("--apply --json cannot prompt; pass --yes to confirm the deletion");
+        }
     } else {
         report::report(&cats, cli.apply, budget_note.as_deref());
-        if cli.apply && freed > 0 {
-            println!("\nfreed {}", human(freed));
+        if apply && !cli.yes {
+            apply = confirm(&cats)?;
         }
     }
+
+    let freed = delete(&cats, &target_dir, apply)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report::json_summary(&cats, &target_dir, apply))?);
+    } else if apply && freed > 0 {
+        println!("\nfreed {}", human(freed));
+    }
     Ok(())
+}
+
+/// Ask before deleting. Off a terminal there is nobody to ask, and guessing
+/// `yes` on a pipe is how a CI job silently cold-rebuilds, so that is an error
+/// rather than a default.
+fn confirm(cats: &[Category]) -> Result<bool> {
+    use std::io::{BufRead, Write};
+
+    let items: usize = cats.iter().map(|c| c.paths.len()).sum();
+    let bytes: u64 = cats.iter().map(|c| c.acct.reclaim()).sum();
+    if !stdin_is_tty() {
+        bail!("--apply needs a terminal to confirm; pass --yes to delete without asking");
+    }
+    print!("\ndelete {items} path(s), freeing {}? [y/N] ", human(bytes));
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(true);
+    }
+    println!("nothing deleted.");
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+#[cfg(not(unix))]
+fn stdin_is_tty() -> bool {
+    true
+}
+
+/// The workspace's own targets as the (kind, name) a fingerprint file spells.
+///
+/// Only the workspace's, because this comes from `cargo metadata --no-deps`:
+/// every registry dependency also has a `lib-*` fingerprint, and reading those
+/// as "this workspace has a lib" would put `--lib` on a bin-only crate, which
+/// cargo rejects outright.
+fn declared_targets(meta: Option<&serde_json::Value>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let Some(pkgs) = meta.and_then(|m| m.get("packages")).and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for pkg in pkgs {
+        let Some(targets) = pkg.get("targets").and_then(|t| t.as_array()) else { continue };
+        for t in targets {
+            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+            let Some(kinds) = t.get("kind").and_then(|k| k.as_array()) else { continue };
+            for k in kinds.iter().filter_map(|k| k.as_str()) {
+                let kind = match k {
+                    "bin" => "bin",
+                    "example" => "example",
+                    "bench" => "bench",
+                    // `test` targets are covered by the test- prefix, and
+                    // `custom-build` is the build script, never selectable.
+                    "test" | "custom-build" => continue,
+                    // lib, rlib, dylib, cdylib, staticlib, proc-macro
+                    _ => "lib",
+                };
+                out.push((kind, name.to_string()));
+                // A lib fingerprint spells the crate name, so a dashed package
+                // name arrives underscored.
+                if kind == "lib" && name.contains('-') {
+                    out.push((kind, name.replace('-', "_")));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A profile dir named the way a person would say it: `debug`, or
@@ -347,23 +466,25 @@ fn delete(cats: &[Category], target_dir: &Path, apply: bool) -> Result<u64> {
 /// The target dir for any workspace: ask cargo, which honours `CARGO_TARGET_DIR`,
 /// `build.target-dir` and workspace inheritance, and fall back to the plain
 /// answers when cargo is unavailable.
-fn resolve_target_dir(cli: &Cli) -> Result<PathBuf> {
-    if let Some(d) = &cli.target_dir {
-        return Ok(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()));
-    }
+fn cargo_metadata(cli: &Cli) -> Option<serde_json::Value> {
     let mut cmd = Command::new("cargo");
     cmd.args(["metadata", "--format-version", "1", "--no-deps"]);
     if let Some(m) = &cli.manifest_path {
         cmd.arg("--manifest-path").arg(m);
     }
-    if let Ok(out) = cmd.output() {
-        if out.status.success() {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                if let Some(d) = v.get("target_directory").and_then(|d| d.as_str()) {
-                    return Ok(PathBuf::from(d));
-                }
-            }
-        }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+fn resolve_target_dir(cli: &Cli, meta: Option<&serde_json::Value>) -> Result<PathBuf> {
+    if let Some(d) = &cli.target_dir {
+        return Ok(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()));
+    }
+    if let Some(d) = meta.and_then(|v| v.get("target_directory")).and_then(|d| d.as_str()) {
+        return Ok(PathBuf::from(d));
     }
     if cli.manifest_path.is_some() {
         bail!("`cargo metadata` failed for the given --manifest-path");

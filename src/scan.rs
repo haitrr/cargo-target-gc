@@ -131,6 +131,62 @@ pub fn has_check_units(profile_dir: &Path) -> bool {
     exts.values().any(|(rmeta, linked)| *rmeta && !*linked)
 }
 
+/// The `cargo build` target-selection flags covering exactly the kinds this
+/// profile has already built, in a stable order.
+///
+/// A fingerprint dir holds one file per unit -- `lib-<name>`, `bin-<name>`,
+/// `example-<name>`, `bench-<name>`, plus the test-mode variants `test-lib-…`,
+/// `test-bin-…`, `test-integration-test-…`, `test-bench-…`. So the tree already
+/// records which kinds a build here has ever produced, and `--all-targets` is
+/// only ever *wider* than that.
+///
+/// Narrowing is safe in the one direction that matters: a kind with no
+/// fingerprint has no units in `deps/` for a sweep to delete, so leaving its
+/// flag off cannot leave anything live unmarked -- it only skips compiling
+/// something that was never here. `--all-targets` on a tree that has never
+/// built its benches is a cold compile of every bench and dev-dependency, paid
+/// to mark nothing.
+///
+/// `declared` is the workspace's own targets as (fingerprint kind, name); it is
+/// what keeps every registry dependency's `lib-*` fingerprint from being read as
+/// "this workspace has a lib".
+pub fn built_kinds(profile_dir: &Path, declared: &[(&'static str, String)]) -> Vec<&'static str> {
+    let mut names: HashSet<String> = HashSet::new();
+    let Ok(rd) = fs::read_dir(profile_dir.join(".fingerprint")) else { return Vec::new() };
+    for e in rd.flatten() {
+        let Ok(inner) = fs::read_dir(e.path()) else { continue };
+        for f in inner.flatten() {
+            let n = f.file_name().to_string_lossy().into_owned();
+            let n = n.strip_suffix(".json").unwrap_or(&n);
+            let n = n.strip_prefix("dep-").or_else(|| n.strip_prefix("output-")).unwrap_or(n);
+            names.insert(n.to_string());
+        }
+    }
+    let mut found: HashSet<&'static str> = HashSet::new();
+    // A registry dependency is never compiled with `--test`, so a `test-`
+    // fingerprint anywhere in the profile belongs to a workspace target and the
+    // prefix alone is proof -- no name matching needed, which is what makes
+    // `tests/*.rs` (fingerprinted `test-integration-test-<name>`) fall out free.
+    if names.iter().any(|n| n.starts_with("test-")) {
+        found.insert("--tests");
+    }
+    for (kind, name) in declared {
+        if !names.contains(&format!("{kind}-{name}")) {
+            continue;
+        }
+        found.insert(match *kind {
+            "lib" => "--lib",
+            "bin" => "--bins",
+            "example" => "--examples",
+            _ => "--benches",
+        });
+    }
+    ["--lib", "--bins", "--examples", "--tests", "--benches"]
+        .into_iter()
+        .filter(|f| found.contains(f))
+        .collect()
+}
+
 /// The lib target names a fingerprint dir is about.
 ///
 /// A fingerprint dir holds one file per output kind -- `lib-foo`, `bin-foo`,
@@ -254,6 +310,47 @@ mod tests {
         // the example's fingerprint joins to examples/, so it is not orphaned
         assert!(units.deps.contains_key("ea73957bd44e0bd0"));
         assert!(units.fps.contains_key("ea73957bd44e0bd0"));
+    }
+
+    /// A profile whose fingerprints say: a bin and its tests were built, a
+    /// registry dep contributed a lib, and the bench never ran.
+    fn kinds_fixture() -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("cargo-target-gc-kinds-{}", std::process::id()))
+            .join("debug");
+        let _ = fs::remove_dir_all(&root);
+        for (dir, files) in [
+            ("serde-1111111111111111", &["lib-serde", "lib-serde.json"][..]),
+            ("wapp-2222222222222222", &["bin-wapp"][..]),
+            ("wapp-3333333333333333", &["test-bin-wapp"][..]),
+            ("wapp-4444444444444444", &["test-integration-test-it"][..]),
+        ] {
+            fs::create_dir_all(root.join(".fingerprint").join(dir)).unwrap();
+            for f in files {
+                fs::write(root.join(".fingerprint").join(dir).join(f), b"x").unwrap();
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn built_kinds_are_only_what_was_built() {
+        let root = kinds_fixture();
+        // the workspace declares a bin and a bench; serde is a dependency, and
+        // its lib fingerprint must not be read as a lib of ours
+        let declared = [
+            ("bin", "wapp".to_string()),
+            ("bench", "throughput".to_string()),
+        ];
+        let kinds = built_kinds(&root, &declared);
+        assert_eq!(kinds, vec!["--bins", "--tests"], "{kinds:?}");
+    }
+
+    #[test]
+    fn built_kinds_see_a_workspace_lib() {
+        let root = kinds_fixture();
+        let declared = [("lib", "serde".to_string())];
+        assert_eq!(built_kinds(&root, &declared), vec!["--lib", "--tests"]);
     }
 
     #[test]
