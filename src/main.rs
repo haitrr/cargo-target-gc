@@ -194,6 +194,12 @@ fn run(cli: Cli) -> Result<()> {
         locked: locked.as_ref(),
     };
 
+    // Measuring is a full walk of target/, which on a large tree is seconds of
+    // silence right after the build. Say what is happening.
+    if !cli.json {
+        eprintln!("  scan: measuring {}", target_dir.display());
+    }
+
     let mut claims = Claims::default();
     let mut cats: Vec<Category> = Vec::new();
     for p in &profiles {

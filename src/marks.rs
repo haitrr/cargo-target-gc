@@ -245,6 +245,9 @@ impl DepsIndex {
 /// A command that has to compile something is not wrong, just slow -- it means
 /// that config was not settled, and its artifacts are now marked either way.
 pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<Marks> {
+    if !quiet {
+        eprintln!("  index: reading unit hashes from {}", target_dir.display());
+    }
     let idx = build_index(target_dir);
     // Each run records the live set afresh: an accumulated mark from last week
     // keeps units that are dead today, which is the whole problem being solved.
@@ -254,13 +257,16 @@ pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<
     for cmd in commands {
         let (exe, rest) = cmd.split_first().context("empty mark command")?;
         if !quiet {
-            eprintln!("  mark: {}", cmd.join(" "));
+            eprintln!("  mark: {} (compiles if this config is cold)", cmd.join(" "));
         }
+        // Cargo's own progress goes straight through: on a cold tree this
+        // command compiles for minutes, and swallowing its stderr is the
+        // difference between "it is building" and "it has hung".
         let mut child = Command::new(exe)
             .args(rest)
             .arg("--message-format=json")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if quiet { Stdio::null() } else { Stdio::inherit() })
             .spawn()
             .with_context(|| format!("running `{}`", cmd.join(" ")))?;
 
