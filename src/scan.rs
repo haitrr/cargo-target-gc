@@ -131,8 +131,9 @@ pub fn has_check_units(profile_dir: &Path) -> bool {
     exts.values().any(|(rmeta, linked)| *rmeta && !*linked)
 }
 
-/// The `cargo build` target-selection flags covering exactly the kinds this
-/// profile has already built, in a stable order.
+/// The extra `cargo build` target-selection flags this profile needs on top of
+/// a plain `cargo build`, in a stable order, or `None` when the fingerprints
+/// could not be read and nothing can be concluded.
 ///
 /// A fingerprint dir holds one file per unit -- `lib-<name>`, `bin-<name>`,
 /// `example-<name>`, `bench-<name>`, plus the test-mode variants `test-lib-…`,
@@ -147,12 +148,17 @@ pub fn has_check_units(profile_dir: &Path) -> bool {
 /// built its benches is a cold compile of every bench and dev-dependency, paid
 /// to mark nothing.
 ///
-/// `declared` is the workspace's own targets as (fingerprint kind, name); it is
-/// what keeps every registry dependency's `lib-*` fingerprint from being read as
-/// "this workspace has a lib".
-pub fn built_kinds(profile_dir: &Path, declared: &[(&'static str, String)]) -> Vec<&'static str> {
+/// Nothing here is matched against the workspace's declared targets, because
+/// nothing needs to be: cargo never builds a *dependency's* tests, examples or
+/// benches, so one of those prefixes anywhere in the profile can only belong to
+/// a workspace target. Lib and bin are the exception -- every registry crate
+/// leaves a `lib-*` fingerprint -- which is why they are not flags here at all.
+/// A plain `cargo build` already selects every lib and bin of every selected
+/// package, and unlike `--lib` it does not fail on a workspace member that
+/// happens to have no library target.
+pub fn built_kinds(profile_dir: &Path) -> Option<Vec<&'static str>> {
     let mut names: HashSet<String> = HashSet::new();
-    let Ok(rd) = fs::read_dir(profile_dir.join(".fingerprint")) else { return Vec::new() };
+    let rd = fs::read_dir(profile_dir.join(".fingerprint")).ok()?;
     for e in rd.flatten() {
         let Ok(inner) = fs::read_dir(e.path()) else { continue };
         for f in inner.flatten() {
@@ -162,29 +168,16 @@ pub fn built_kinds(profile_dir: &Path, declared: &[(&'static str, String)]) -> V
             names.insert(n.to_string());
         }
     }
-    let mut found: HashSet<&'static str> = HashSet::new();
-    // A registry dependency is never compiled with `--test`, so a `test-`
-    // fingerprint anywhere in the profile belongs to a workspace target and the
-    // prefix alone is proof -- no name matching needed, which is what makes
-    // `tests/*.rs` (fingerprinted `test-integration-test-<name>`) fall out free.
-    if names.iter().any(|n| n.starts_with("test-")) {
-        found.insert("--tests");
-    }
-    for (kind, name) in declared {
-        if !names.contains(&format!("{kind}-{name}")) {
-            continue;
-        }
-        found.insert(match *kind {
-            "lib" => "--lib",
-            "bin" => "--bins",
-            "example" => "--examples",
-            _ => "--benches",
-        });
-    }
-    ["--lib", "--bins", "--examples", "--tests", "--benches"]
-        .into_iter()
-        .filter(|f| found.contains(f))
-        .collect()
+    // `test-bench-<name>` is a bench target compiled in test mode, so it is a
+    // test unit and not proof that `cargo bench` ever ran -- the `test-` arm
+    // matching first is what keeps those apart.
+    Some(
+        [("test-", "--tests"), ("example-", "--examples"), ("bench-", "--benches")]
+            .into_iter()
+            .filter(|(prefix, _)| names.iter().any(|n| n.starts_with(prefix)))
+            .map(|(_, flag)| flag)
+            .collect(),
+    )
 }
 
 /// The lib target names a fingerprint dir is about.
@@ -283,9 +276,12 @@ mod tests {
     /// A profile dir shaped like the two cases that used to be misread as dead
     /// units: a `cdylib` crate, whose artifacts carry no hash at all, and an
     /// example, whose artifacts live in `examples/` rather than `deps/`.
-    fn fixture() -> PathBuf {
+    /// `tag` keeps concurrently-running tests off each other's tree: these
+    /// fixtures rebuild from scratch, so two tests sharing a path race between
+    /// one's remove_dir_all and the other's create_dir_all.
+    fn fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir()
-            .join(format!("cargo-target-gc-test-{}", std::process::id()))
+            .join(format!("cargo-target-gc-test-{}-{tag}", std::process::id()))
             .join("debug");
         let _ = fs::remove_dir_all(&root);
         for sub in ["deps", "examples", ".fingerprint/wdyl-713fd3ae45c909df", ".fingerprint/wlib-ea73957bd44e0bd0"] {
@@ -305,7 +301,7 @@ mod tests {
 
     #[test]
     fn examples_are_indexed_as_artifacts() {
-        let root = fixture();
+        let root = fixture("examples");
         let units = scan_units(&root);
         // the example's fingerprint joins to examples/, so it is not orphaned
         assert!(units.deps.contains_key("ea73957bd44e0bd0"));
@@ -313,10 +309,10 @@ mod tests {
     }
 
     /// A profile whose fingerprints say: a bin and its tests were built, a
-    /// registry dep contributed a lib, and the bench never ran.
-    fn kinds_fixture() -> PathBuf {
+    /// registry dep contributed a lib, and no bench or example ever ran.
+    fn kinds_fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir()
-            .join(format!("cargo-target-gc-kinds-{}", std::process::id()))
+            .join(format!("cargo-target-gc-kinds-{}-{tag}", std::process::id()))
             .join("debug");
         let _ = fs::remove_dir_all(&root);
         for (dir, files) in [
@@ -324,6 +320,8 @@ mod tests {
             ("wapp-2222222222222222", &["bin-wapp"][..]),
             ("wapp-3333333333333333", &["test-bin-wapp"][..]),
             ("wapp-4444444444444444", &["test-integration-test-it"][..]),
+            // a bench target built in test mode -- a test unit, not a bench run
+            ("wapp-5555555555555555", &["test-bench-throughput"][..]),
         ] {
             fs::create_dir_all(root.join(".fingerprint").join(dir)).unwrap();
             for f in files {
@@ -335,27 +333,29 @@ mod tests {
 
     #[test]
     fn built_kinds_are_only_what_was_built() {
-        let root = kinds_fixture();
-        // the workspace declares a bin and a bench; serde is a dependency, and
-        // its lib fingerprint must not be read as a lib of ours
-        let declared = [
-            ("bin", "wapp".to_string()),
-            ("bench", "throughput".to_string()),
-        ];
-        let kinds = built_kinds(&root, &declared);
-        assert_eq!(kinds, vec!["--bins", "--tests"], "{kinds:?}");
+        let root = kinds_fixture("built");
+        let kinds = built_kinds(&root).unwrap();
+        // lib and bin are covered by a plain `cargo build`, never by a flag:
+        // `--lib` fails outright on a workspace member with no library target.
+        assert_eq!(kinds, vec!["--tests"], "{kinds:?}");
     }
 
     #[test]
-    fn built_kinds_see_a_workspace_lib() {
-        let root = kinds_fixture();
-        let declared = [("lib", "serde".to_string())];
-        assert_eq!(built_kinds(&root, &declared), vec!["--lib", "--tests"]);
+    fn a_bench_run_is_distinguished_from_a_bench_built_for_test() {
+        let root = kinds_fixture("bench");
+        fs::create_dir_all(root.join(".fingerprint/wapp-6666666666666666")).unwrap();
+        fs::write(root.join(".fingerprint/wapp-6666666666666666/bench-throughput"), b"x").unwrap();
+        assert_eq!(built_kinds(&root).unwrap(), vec!["--tests", "--benches"]);
+    }
+
+    #[test]
+    fn unreadable_fingerprints_conclude_nothing() {
+        assert_eq!(built_kinds(Path::new("/nonexistent-target/debug")), None);
     }
 
     #[test]
     fn cdylib_units_are_unprovable() {
-        let root = fixture();
+        let root = fixture("cdylib");
         let hashless = hashless_lib_targets(&root);
         assert!(hashless.contains("wdyl"), "{hashless:?}");
         // .d files are dep-info, not artifacts, and must not exempt anything

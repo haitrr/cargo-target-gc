@@ -177,28 +177,46 @@ fn run(cli: Cli) -> Result<()> {
         let cmds: Vec<Vec<String>> = if cli.build.is_empty() {
             // Only the target kinds this tree has actually built. `--all-targets`
             // would compile the rest from cold to mark units that do not exist.
-            let declared = declared_targets(meta.as_ref());
-            let mut kinds: Vec<&'static str> = Vec::new();
-            for p in &profiles {
-                for k in scan::built_kinds(p, &declared) {
-                    if !kinds.contains(&k) {
-                        kinds.push(k);
-                    }
+            let read: Vec<Vec<&'static str>> =
+                profiles.iter().filter_map(|p| scan::built_kinds(p)).collect();
+            let mut extra: Vec<&'static str> = Vec::new();
+            for k in read.iter().flatten() {
+                if !extra.contains(k) {
+                    extra.push(*k);
                 }
             }
-            if kinds.is_empty() {
-                kinds.push("--all-targets");
+            if read.is_empty() {
+                // Nothing could be read, so nothing can be ruled out.
+                extra = vec!["--all-targets"];
             } else if !cli.json {
-                eprintln!(
-                    "note: this tree has only built {}, so that is all the default marks compile",
-                    kinds.join(" ")
-                );
+                let skipped: Vec<&str> = ["--tests", "--examples", "--benches"]
+                    .into_iter()
+                    .filter(|f| !extra.contains(f))
+                    .collect();
+                if !skipped.is_empty() {
+                    eprintln!(
+                        "note: this tree has never built {}, so the default marks skip them",
+                        skipped.join(" ")
+                    );
+                }
             }
-            let sel = |mut c: Vec<String>| {
-                c.extend(kinds.iter().map(|k| k.to_string()));
-                c
+            // One command per selection rather than one command carrying them
+            // all, because any target-selection flag *replaces* cargo's default
+            // selection: `cargo build --tests` builds the test harnesses and
+            // not the lib and bins. The bare run is what covers those, and it
+            // is the only spelling that does so without `--lib`, which fails
+            // outright on a workspace member that has no library target. Each
+            // extra run is a freshness check on a warm tree.
+            let sel = |base: &str| -> Vec<Vec<String>> {
+                let mut out = vec![vec!["cargo".into(), base.to_string()]];
+                out.extend(
+                    extra
+                        .iter()
+                        .map(|f| vec!["cargo".into(), base.to_string(), f.to_string()]),
+                );
+                out
             };
-            let mut default = vec![sel(vec!["cargo".into(), "build".into()])];
+            let mut default = sel("build");
             // Check units are separate units with their own hashes, so a build
             // command never resolves to them. Naming `cargo check` only when the
             // tree already has such units keeps the default from compiling
@@ -207,7 +225,7 @@ fn run(cli: Cli) -> Result<()> {
                 if !cli.json {
                     eprintln!("note: this tree has `cargo check` units, so they are marked too");
                 }
-                default.push(sel(vec!["cargo".into(), "check".into()]));
+                default.extend(sel("check"));
             }
             default
         } else {
@@ -378,45 +396,6 @@ fn stdin_is_tty() -> bool {
 #[cfg(not(unix))]
 fn stdin_is_tty() -> bool {
     true
-}
-
-/// The workspace's own targets as the (kind, name) a fingerprint file spells.
-///
-/// Only the workspace's, because this comes from `cargo metadata --no-deps`:
-/// every registry dependency also has a `lib-*` fingerprint, and reading those
-/// as "this workspace has a lib" would put `--lib` on a bin-only crate, which
-/// cargo rejects outright.
-fn declared_targets(meta: Option<&serde_json::Value>) -> Vec<(&'static str, String)> {
-    let mut out = Vec::new();
-    let Some(pkgs) = meta.and_then(|m| m.get("packages")).and_then(|p| p.as_array()) else {
-        return out;
-    };
-    for pkg in pkgs {
-        let Some(targets) = pkg.get("targets").and_then(|t| t.as_array()) else { continue };
-        for t in targets {
-            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
-            let Some(kinds) = t.get("kind").and_then(|k| k.as_array()) else { continue };
-            for k in kinds.iter().filter_map(|k| k.as_str()) {
-                let kind = match k {
-                    "bin" => "bin",
-                    "example" => "example",
-                    "bench" => "bench",
-                    // `test` targets are covered by the test- prefix, and
-                    // `custom-build` is the build script, never selectable.
-                    "test" | "custom-build" => continue,
-                    // lib, rlib, dylib, cdylib, staticlib, proc-macro
-                    _ => "lib",
-                };
-                out.push((kind, name.to_string()));
-                // A lib fingerprint spells the crate name, so a dashed package
-                // name arrives underscored.
-                if kind == "lib" && name.contains('-') {
-                    out.push((kind, name.replace('-', "_")));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// A profile dir named the way a person would say it: `debug`, or
