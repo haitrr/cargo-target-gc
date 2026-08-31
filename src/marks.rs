@@ -244,11 +244,6 @@ impl DepsIndex {
 /// Run each command with `--message-format=json` and record the unit hashes it
 /// resolves to.
 ///
-/// Every command here is one you named: there is no default build, because
-/// nothing in a target dir records which command filled it, and a wrong guess
-/// is a cold compile of a config whose units were never there. So a cold
-/// command is treated as a mistake -- see `cold_foreign_compile` -- and
-/// `allow_cold` is what it takes to sit through one deliberately.
 /// What a mark run produced. `complete` is false when a command was skipped for
 /// being cold: the live set then covers only some of the configs asked for, and
 /// sweeping unit variants against it would delete the rest.
@@ -257,8 +252,18 @@ pub struct Marked {
     pub complete: bool,
 }
 
+/// Record the live set of every command.
+///
+/// The first route is to ask cargo as a library what the command resolves to
+/// (`crate::plan`), which compiles nothing at all -- so a config this tree has
+/// never held costs a second instead of an hour, and the answer is the same
+/// either way. Only when that fails (a front end that is not a cargo
+/// subcommand, a flag the planner does not model, a cargo API that has moved
+/// under us) does the command actually run, and there the cold check still
+/// applies.
 pub fn mark(
     target_dir: &Path,
+    manifest: Option<&Path>,
     commands: &[Vec<String>],
     allow_cold: bool,
     quiet: bool,
@@ -274,6 +279,26 @@ pub fn mark(
     let now = crate::collect::now_secs();
 
     for cmd in commands {
+        // The cheap route: cargo can resolve the unit graph and name every
+        // hash without running rustc on anything.
+        if let Some(manifest) = manifest {
+            match crate::plan::unit_hashes(manifest, cmd) {
+                Ok(hashes) => {
+                    if !quiet {
+                        eprintln!("  plan: {} — {} units (nothing compiled)", cmd.join(" "), hashes.len());
+                    }
+                    for h in hashes {
+                        marks.0.insert(h, now);
+                    }
+                    continue;
+                }
+                Err(e) if !quiet => {
+                    eprintln!("  note: cannot plan `{}` ({e}); running it instead", cmd.join(" "));
+                }
+                Err(_) => {}
+            }
+        }
+
         let (exe, rest) = cmd.split_first().context("empty mark command")?;
         if !quiet {
             eprintln!("  mark: {} (compiles if this config is cold)", cmd.join(" "));
@@ -370,6 +395,22 @@ pub fn mark(
                 unresolved[0]
             );
         }
+    }
+
+    // A live set that matches nothing on disk is not a live set. Either every
+    // command named a config this tree has never held, or -- the dangerous
+    // one -- the linked cargo hashes differently from the cargo that filled
+    // this tree, in which case every unit here looks dead and --apply would
+    // delete the lot.
+    if !marks.is_empty() && !idx.known.is_empty() && !marks.0.keys().any(|h| idx.known.contains(h)) {
+        complete = false;
+        eprintln!(
+            "  warning: none of the {} planned units appear in this tree. Either nothing here \
+             was built by these commands, or the linked cargo ({}) hashes differently from the \
+             one that filled it — not sweeping unit variants.",
+            marks.len(),
+            crate::plan::linked_cargo_version(),
+        );
     }
 
     // Only a complete run is worth recording: a partial live set read back by a

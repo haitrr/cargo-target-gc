@@ -14,6 +14,7 @@ mod collect;
 mod fsutil;
 mod lockfile;
 mod marks;
+mod plan;
 mod report;
 mod scan;
 
@@ -33,8 +34,9 @@ HOW IT DECIDES
   garbage cargo will never collect. There is no timestamp that tells the two
   apart — cargo does not touch a unit when it comes back Fresh, so mtime records
   when a unit was last COMPILED, not when it was last USED. So this asks cargo
-  directly: it runs your build (a no-op if the tree is warm), records the units
-  that build resolves to, and deletes the rest.
+  directly, as a library: cargo resolves the unit graph for each build and hands
+  over the same hashes it would put in the file names, WITHOUT compiling
+  anything. Everything those builds do not name is garbage.
 
   The default build is narrowed to what this tree can be shown to have built:
   the target kinds in .fingerprint/, and the compile modes in deps/ — a tree an
@@ -47,15 +49,11 @@ HOW IT DECIDES
 
     cargo target-gc --apply --build 'cargo build' --build 'cargo clippy --all-targets'
 
-  What no artifact records is which FEATURES built it, so that part cannot be
-  narrowed — and it is where a default goes wrong on a workspace whose real loop
-  is `--no-default-features -p foo`. So a mark command that compiles a DEPENDENCY
-  into a unit hash this tree has never held is taken as proof of it, and skipped
-  within seconds instead of running to the end. The rest of the run continues,
-  minus the unit sweep, which that command's live set is now missing. Neither a
-  crate of your own recompiling nor a dependency rebuilt under a hash the tree
-  already has counts — the second is an ordinary stale-mtime cascade.
-  (--allow-cold sits through it and marks it.)
+  A command the planner cannot model — `cargo clippy`, or a flag it does not
+  know — falls back to being RUN, and there a cold build is still possible: a
+  dependency compiled into a unit hash this tree has never held means that
+  command is not one this target/ was made by, so it is skipped (--allow-cold
+  sits through it instead). The rest of the run continues, minus the unit sweep.
 
 WHAT IT DELETES
   unit variants     every unit no named build resolves to
@@ -202,7 +200,9 @@ fn run(cli: Cli) -> Result<()> {
         } else {
             cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect()
         };
-        let marked = marks::mark(&target_dir, &cmds, cli.allow_cold, cli.json)?;
+        let manifest = workspace_manifest(&cli, meta.as_ref());
+        let marked =
+            marks::mark(&target_dir, manifest.as_deref(), &cmds, cli.allow_cold, cli.json)?;
         // A run that skipped a cold command knows only part of the live set, and
         // sweeping unit variants against part of it deletes the rest. Everything
         // that needs no live set is still collected below.
@@ -350,6 +350,17 @@ fn run(cli: Cli) -> Result<()> {
         println!("\nfreed {}", human(freed));
     }
     Ok(())
+}
+
+/// The manifest whose unit graph a mark command resolves against: the
+/// workspace root's, since that is what a bare `cargo build` here would use.
+fn workspace_manifest(cli: &Cli, meta: Option<&serde_json::Value>) -> Option<PathBuf> {
+    if let Some(m) = &cli.manifest_path {
+        return std::fs::canonicalize(m).ok();
+    }
+    let root = meta.and_then(|v| v.get("workspace_root")).and_then(|d| d.as_str())?;
+    let manifest = Path::new(root).join("Cargo.toml");
+    manifest.is_file().then_some(manifest)
 }
 
 /// The workspace's own compilable targets, as (name, is_lib) -- the key that
