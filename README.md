@@ -44,19 +44,28 @@ collection never turns into a cold compile:
 
 What no artifact records is which **features** produced it — so that part cannot
 be narrowed, and it is exactly where a default goes wrong on a workspace whose
-real inner loop is an alias like `build --no-default-features -p oxy-server`. So
-a mark command that starts compiling a **registry dependency** is taken as proof
-it resolves a unit graph this tree does not have, and the run stops within
-seconds instead of sitting through it:
+real inner loop is an alias like `build --no-default-features -p oxy-server`.
+What gives it away is a **dependency compiled into a unit hash this tree has
+never held**: that config's units were never here, so the command is skipped
+within seconds instead of running to the end.
 
 ```
-error: `cargo build --release` is cold in this tree — it started compiling
-unicode-ident, a registry dependency, so this is not a build this target/ was
-made by. Nothing was deleted.
+warning: `cargo build --release` is cold — it compiled itoa into a unit this tree
+has never held, so this is not a build this target/ was made by. Skipping it.
+note: a mark command was skipped, so the live set is incomplete — unit variants
+are left alone this run.
 ```
 
-`--allow-cold` sits through it anyway. A crate of your own recompiling is just
-an edit you made, and is what marking is for.
+The rest of the run carries on: the other mark commands still run, and every
+category that needs no live set is still collected. Only the unit sweep is
+withheld, because the skipped command's units are exactly what it would delete.
+
+Two things deliberately do *not* count as cold. A crate of your own recompiling
+is just an edit you made, and is what marking is for. And a dependency rebuilt
+under a hash the tree already holds is an ordinary stale-mtime cascade — cargo
+does this constantly (`FsStatusOutdated(StaleDepFingerprint)`), for the same
+config and the same units. `--allow-cold` sits through a cold build anyway and
+marks it.
 
 Name every config you actually use — anything you leave out is deleted and
 cold-rebuilds when you next switch to it:

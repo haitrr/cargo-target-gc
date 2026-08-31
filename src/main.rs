@@ -49,11 +49,13 @@ HOW IT DECIDES
 
   What no artifact records is which FEATURES built it, so that part cannot be
   narrowed — and it is where a default goes wrong on a workspace whose real loop
-  is `--no-default-features -p foo`. So a mark command that starts compiling a
-  REGISTRY dependency is taken as proof it resolves a unit graph this tree does
-  not have: the run stops in seconds instead of sitting through the cold build,
-  and names what to pass to --build. (--allow-cold overrides.) A crate of your
-  own recompiling is just an edit, and is what marking is for.
+  is `--no-default-features -p foo`. So a mark command that compiles a DEPENDENCY
+  into a unit hash this tree has never held is taken as proof of it, and skipped
+  within seconds instead of running to the end. The rest of the run continues,
+  minus the unit sweep, which that command's live set is now missing. Neither a
+  crate of your own recompiling nor a dependency rebuilt under a hash the tree
+  already has counts — the second is an ordinary stale-mtime cascade.
+  (--allow-cold sits through it and marks it.)
 
 WHAT IT DELETES
   unit variants     every unit no named build resolves to
@@ -200,7 +202,22 @@ fn run(cli: Cli) -> Result<()> {
         } else {
             cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect()
         };
-        Some(marks::mark(&target_dir, &cmds, cli.allow_cold, cli.json)?)
+        let marked = marks::mark(&target_dir, &cmds, cli.allow_cold, cli.json)?;
+        // A run that skipped a cold command knows only part of the live set, and
+        // sweeping unit variants against part of it deletes the rest. Everything
+        // that needs no live set is still collected below.
+        if !marked.complete {
+            if !cli.json {
+                eprintln!(
+                    "note: a mark command was skipped, so the live set is incomplete — unit \
+                     variants are left alone this run. Name the build that config really \
+                     uses with --build, or pass --allow-cold to compile it and mark it."
+                );
+            }
+            None
+        } else {
+            Some(marked.marks)
+        }
     };
 
     let lockpath = lockfile::find_lockfile(&target_dir);

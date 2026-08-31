@@ -9,7 +9,7 @@
 //! commands with `--message-format=json` and records the live unit hashes;
 //! `--sweep` then deletes every hash no mark covers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -101,6 +101,9 @@ struct DepsIndex {
     /// resort, and the only route for a unit whose artifacts carry no hash at
     /// all (`cdylib`/`staticlib`); see scan::hashless_lib_targets.
     by_fingerprint: HashMap<(String, String), Vec<Cand>>,
+    /// Every unit hash this tree holds, however it holds it. Membership is what
+    /// separates a unit being *recompiled* from a unit that was never here.
+    known: HashSet<String>,
 }
 
 /// Split a file name into the part before the first dot and the rest
@@ -125,6 +128,7 @@ fn build_index(target_dir: &Path) -> DepsIndex {
                 if m.nlink > 1 {
                     idx.by_ino.insert(m.ino, h.to_string());
                 }
+                idx.known.insert(h.to_string());
                 let base = st[..st.len() - 17].to_string();
                 idx.by_uplift
                     .entry((base, ext.to_string()))
@@ -136,6 +140,7 @@ fn build_index(target_dir: &Path) -> DepsIndex {
         for e in rd.flatten() {
             let dirname = e.file_name().to_string_lossy().into_owned();
             let Some(h) = unit_hash(&dirname) else { continue };
+            idx.known.insert(h.to_string());
             let Ok(inner) = fs::read_dir(e.path()) else { continue };
             for f in inner.flatten() {
                 let fname = f.file_name().to_string_lossy().into_owned();
@@ -244,12 +249,20 @@ impl DepsIndex {
 /// is a cold compile of a config whose units were never there. So a cold
 /// command is treated as a mistake -- see `cold_foreign_compile` -- and
 /// `allow_cold` is what it takes to sit through one deliberately.
+/// What a mark run produced. `complete` is false when a command was skipped for
+/// being cold: the live set then covers only some of the configs asked for, and
+/// sweeping unit variants against it would delete the rest.
+pub struct Marked {
+    pub marks: Marks,
+    pub complete: bool,
+}
+
 pub fn mark(
     target_dir: &Path,
     commands: &[Vec<String>],
     allow_cold: bool,
     quiet: bool,
-) -> Result<Marks> {
+) -> Result<Marked> {
     if !quiet {
         eprintln!("  index: reading unit hashes from {}", target_dir.display());
     }
@@ -257,6 +270,7 @@ pub fn mark(
     // Each run records the live set afresh: an accumulated mark from last week
     // keeps units that are dead today, which is the whole problem being solved.
     let mut marks = Marks::default();
+    let mut complete = true;
     let now = crate::collect::now_secs();
 
     for cmd in commands {
@@ -282,7 +296,7 @@ pub fn mark(
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 if !allow_cold {
-                    if let Some(pkg) = cold_foreign_compile(&msg) {
+                    if let Some(pkg) = cold_unit(&msg, &idx.known) {
                         cold = Some(pkg);
                         break;
                     }
@@ -319,18 +333,19 @@ pub fn mark(
                 }
             }
         }
+        // A cold command is dropped, not fatal: the rest of the run -- the other
+        // commands, and every category that needs no live set -- is still worth
+        // having. What it costs is the unit sweep, which `complete` withholds.
         if let Some(pkg) = cold {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!(
-                "`{}` is cold in this tree — it started compiling {pkg}, a registry \
-                 dependency, so this is not a build this target/ was made by. Nothing was \
-                 deleted.\n  Name the builds you actually run (check your `[alias]`es and \
-                 what your editor runs), e.g.\n    cargo target-gc --build 'cargo build \
-                 --no-default-features -p foo'\n  or pass --allow-cold to sit through the \
-                 cold build and mark it anyway.",
+            complete = false;
+            eprintln!(
+                "  warning: `{}` is cold — it compiled {pkg} into a unit this tree has \
+                 never held, so this is not a build this target/ was made by. Skipping it.",
                 cmd.join(" ")
             );
+            continue;
         }
         let status = child.wait()?;
         if !status.success() {
@@ -357,26 +372,37 @@ pub fn mark(
         }
     }
 
-    save(target_dir, &marks)?;
-    Ok(marks)
+    // Only a complete run is worth recording: a partial live set read back by a
+    // later --no-build run would sweep every config the skipped command covered.
+    if complete {
+        save(target_dir, &marks)?;
+    }
+    Ok(Marked { marks, complete })
 }
 
-/// The package name when this message is a registry dependency that cargo just
-/// compiled, rather than found fresh.
+/// The package name when this message is a dependency compiled under a unit
+/// hash this tree does not hold -- the one thing that proves a mark command is
+/// not a build this target/ was made by.
 ///
-/// This is the signal that a mark command is not the build this tree was made
-/// by. A crate you wrote compiling is the normal case — you edited it since the
-/// last build, and marking exists to pick that up. A crate out of the registry
-/// or a git checkout compiling is not: those are settled by construction, so one
-/// going cold means this command resolved a different unit graph (other
-/// features, other RUSTFLAGS, another `--target`) than anything in `deps/`.
-/// Continuing would be a full cold build paid to mark units that were never
-/// here.
+/// Both halves are load-bearing. A crate you wrote recompiling is the normal
+/// case: you edited it, and marking exists to pick that up. And a *dependency*
+/// recompiling is not enough on its own either, which is what an earlier
+/// version of this got wrong: cargo re-runs settled units all the time on an
+/// mtime cascade (`FsStatusOutdated(StaleDepFingerprint)`), under their
+/// existing hashes, for the same config -- and aborting there throws away a run
+/// that was about to succeed.
 ///
-/// The test is the cargo cache path rather than "outside the workspace root",
-/// because a path dependency in a sibling directory is yours too — you edit it,
-/// it recompiles, and that must not read as a wrong config.
-pub fn cold_foreign_compile(msg: &serde_json::Value) -> Option<String> {
+/// A hash that appears nowhere in `deps/`, `examples/` or `.fingerprint/` is
+/// different in kind: this command resolved a unit graph the tree has never
+/// held (other features, other RUSTFLAGS, another `--target`), so continuing is
+/// a cold build of a whole config, paid to mark units that were never here.
+///
+/// Dependency, not workspace member, because a hash of *yours* can be new for
+/// an innocent reason -- you added a feature, renamed a crate, edited a
+/// manifest -- and the recompile is one you would have paid anyway. The test is
+/// the cargo cache path rather than "outside the workspace root", since a path
+/// dependency in a sibling directory is yours too.
+pub fn cold_unit(msg: &serde_json::Value, known: &HashSet<String>) -> Option<String> {
     if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
         return None;
     }
@@ -385,6 +411,21 @@ pub fn cold_foreign_compile(msg: &serde_json::Value) -> Option<String> {
     }
     let manifest = msg.get("manifest_path").and_then(|m| m.as_str())?;
     if !is_cached_dep(manifest) {
+        return None;
+    }
+    // An artifact whose name carries no hash (a cdylib, a staticlib) is no
+    // evidence either way, and there is no cheaper reading of it here.
+    let mut saw_hash = false;
+    for f in msg.get("filenames").and_then(|f| f.as_array()).into_iter().flatten() {
+        let Some(name) = f.as_str().and_then(|p| Path::new(p).file_name()) else { continue };
+        let name = name.to_string_lossy().into_owned();
+        let Some(h) = unit_hash(stem(&name)) else { continue };
+        if known.contains(h) {
+            return None;
+        }
+        saw_hash = true;
+    }
+    if !saw_hash {
         return None;
     }
     let id = msg.get("package_id").and_then(|p| p.as_str()).unwrap_or("");
@@ -425,35 +466,65 @@ fn pkg_label(id: &str, manifest: &str) -> String {
 mod tests {
     use super::*;
 
-    fn artifact(id: &str, manifest: &str, fresh: bool) -> serde_json::Value {
+    fn artifact(id: &str, manifest: &str, fresh: bool, files: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "reason": "compiler-artifact",
             "package_id": id,
             "manifest_path": manifest,
             "fresh": fresh,
+            "filenames": files,
         })
     }
 
     const REG: &str = "/home/u/.cargo/registry/src/index.crates.io-1949/proc-macro2-1.0.106/Cargo.toml";
+    const ID: &str = "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.106";
 
+    fn known(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|h| h.to_string()).collect()
+    }
+
+    /// A unit hash this tree has never held is the proof: that config's units
+    /// were never here, so the whole build is being paid for nothing.
     #[test]
-    fn a_cold_registry_dep_means_the_command_is_the_wrong_one() {
-        let id = "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.106";
-        assert_eq!(cold_foreign_compile(&artifact(id, REG, false)), Some("proc-macro2".into()));
+    fn a_dep_compiled_under_an_unknown_hash_is_a_cold_config() {
+        let m = artifact(ID, REG, false, &["/t/debug/deps/libproc_macro2-aaaaaaaaaaaaaaaa.rlib"]);
+        assert_eq!(cold_unit(&m, &known(&["1111111111111111"])), Some("proc-macro2".into()));
         // the pre-2024 spelling of the same id
         let old = "proc-macro2 1.0.106 (registry+https://github.com/rust-lang/crates.io-index)";
-        assert_eq!(cold_foreign_compile(&artifact(old, REG, false)), Some("proc-macro2".into()));
+        let m = artifact(old, REG, false, &["/t/debug/deps/libproc_macro2-aaaaaaaaaaaaaaaa.rlib"]);
+        assert_eq!(cold_unit(&m, &HashSet::new()), Some("proc-macro2".into()));
+    }
+
+    /// The case that used to abort the run wrongly: cargo re-running a unit the
+    /// tree already holds. An mtime cascade (`StaleDepFingerprint`) recompiles
+    /// registry crates under their EXISTING hashes -- same config, same units,
+    /// just stale -- and stopping there throws away a run that was going to
+    /// work.
+    #[test]
+    fn a_dep_recompiled_under_a_hash_we_hold_is_just_stale() {
+        let m = artifact(ID, REG, false, &["/t/debug/deps/libproc_macro2-aaaaaaaaaaaaaaaa.rlib"]);
+        assert_eq!(cold_unit(&m, &known(&["aaaaaaaaaaaaaaaa"])), None);
     }
 
     #[test]
     fn a_fresh_dep_or_an_edited_crate_of_yours_is_not_a_cold_config() {
-        let id = "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.106";
-        assert_eq!(cold_foreign_compile(&artifact(id, REG, true)), None);
+        let m = artifact(ID, REG, true, &["/t/debug/deps/libproc_macro2-aaaaaaaaaaaaaaaa.rlib"]);
+        assert_eq!(cold_unit(&m, &HashSet::new()), None);
         // you edited it since the last build; marking exists to pick that up
         let mine = "path+file:///ws/crates/myapp#0.1.0";
-        assert_eq!(cold_foreign_compile(&artifact(mine, "/ws/crates/myapp/Cargo.toml", false)), None);
+        let m = artifact(mine, "/ws/crates/myapp/Cargo.toml", false, &["/t/debug/deps/libmyapp-bbbbbbbbbbbbbbbb.rlib"]);
+        assert_eq!(cold_unit(&m, &HashSet::new()), None);
         // a path dependency you keep next door is yours as well
         let nb = "path+file:///elsewhere/shared#0.1.0";
-        assert_eq!(cold_foreign_compile(&artifact(nb, "/elsewhere/shared/Cargo.toml", false)), None);
+        let m = artifact(nb, "/elsewhere/shared/Cargo.toml", false, &["/t/debug/deps/libshared-cccccccccccccccc.rlib"]);
+        assert_eq!(cold_unit(&m, &HashSet::new()), None);
+    }
+
+    /// No hash to read means no evidence either way, and guessing "cold" would
+    /// stop a run over a `cdylib` whose artifacts never carry one.
+    #[test]
+    fn an_artifact_with_no_hash_proves_nothing() {
+        let m = artifact(ID, REG, false, &["/t/debug/deps/libproc_macro2.dylib"]);
+        assert_eq!(cold_unit(&m, &HashSet::new()), None);
     }
 }
