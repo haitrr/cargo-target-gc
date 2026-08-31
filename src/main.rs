@@ -358,7 +358,7 @@ fn workspace_targets(meta: Option<&serde_json::Value>) -> Vec<(String, bool)> {
             }) {
                 out.push((name.to_string(), true));
             }
-            if kinds.iter().any(|k| *k == "bin") {
+            if kinds.contains(&"bin") {
                 out.push((name.to_string(), false));
             }
         }
