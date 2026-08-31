@@ -27,10 +27,48 @@ cargo target-gc            # report what would go, delete nothing
 cargo target-gc --apply    # delete it
 ```
 
-Both run your build first (a freshness check on a warm tree), record the units
-it resolves to, and treat everything else as garbage. Name every config you
-actually use — anything you leave out is deleted and cold-rebuilds when you next
-switch to it:
+Both run your builds first (a freshness check on a warm tree), record the units
+they resolve to, and treat everything else as garbage.
+
+The default is narrowed to what this tree can be **shown** to have built, so a
+collection never turns into a cold compile:
+
+* the target kinds in `.fingerprint/` — never built benches means no
+  `--benches`;
+* the compile modes in `deps/`, judged on *your own* crates — a tree an editor
+  only ever `cargo check`ed defaults to `cargo check`, not to a full cold
+  `cargo build`. (Check units are separate units with their own hashes, so no
+  build command ever resolves to one; and `cargo check` compiles build-script
+  dependencies for real, which is why the question is asked about your targets
+  and not about the profile as a whole.)
+
+What no artifact records is which **features** produced it — so that part cannot
+be narrowed, and it is exactly where a default goes wrong on a workspace whose
+real inner loop is an alias like `build --no-default-features -p oxy-server`.
+What gives it away is a **dependency compiled into a unit hash this tree has
+never held**: that config's units were never here, so the command is skipped
+within seconds instead of running to the end.
+
+```
+warning: `cargo build --release` is cold — it compiled itoa into a unit this tree
+has never held, so this is not a build this target/ was made by. Skipping it.
+note: a mark command was skipped, so the live set is incomplete — unit variants
+are left alone this run.
+```
+
+The rest of the run carries on: the other mark commands still run, and every
+category that needs no live set is still collected. Only the unit sweep is
+withheld, because the skipped command's units are exactly what it would delete.
+
+Two things deliberately do *not* count as cold. A crate of your own recompiling
+is just an edit you made, and is what marking is for. And a dependency rebuilt
+under a hash the tree already holds is an ordinary stale-mtime cascade — cargo
+does this constantly (`FsStatusOutdated(StaleDepFingerprint)`), for the same
+config and the same units. `--allow-cold` sits through a cold build anyway and
+marks it.
+
+Name every config you actually use — anything you leave out is deleted and
+cold-rebuilds when you next switch to it:
 
 ```sh
 cargo target-gc --apply \
@@ -39,21 +77,12 @@ cargo target-gc --apply \
   --build 'cargo clippy --all-targets'
 ```
 
-The default is `cargo build --all-targets`, which covers lib, bins, tests,
-examples and benches for your default features, plus `cargo check --all-targets`
-when the tree already contains check units. That second one matters: a check unit
-emits metadata only and is a *different unit* with its own hash, so a build
-command never resolves to one — without it, `cargo check` runs cold after a
-collection. It is only added when such units already exist, so the default never
-compiles metadata nobody asked for.
+Anything driven by another compiler front end is invisible to the default and
+needs naming explicitly — `--build 'cargo clippy --all-targets'`, and whatever
+your editor runs if it shares this target dir.
 
-Anything driven by another compiler front-end is invisible to both and needs
-naming explicitly — `--build 'cargo clippy --all-targets'`, and whatever your
-editor runs if it shares this target dir. Note that on a tree where tests were
-never built, the first run compiles them.
-
-Other flags: `--no-build` reports without running anything (and then only
-collects what needs no live set), `--keep-incremental N|all`, `--budget 20G`,
+Other flags: `--no-build` (report without running anything, and then only
+collect what needs no live set), `--keep-incremental N|all`, `--budget 20G`,
 `--json`, `--target-dir`, `--manifest-path`.
 
 It works in any workspace: the target dir comes from `cargo metadata`, so
