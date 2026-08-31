@@ -33,25 +33,27 @@ HOW IT DECIDES
   garbage cargo will never collect. There is no timestamp that tells the two
   apart — cargo does not touch a unit when it comes back Fresh, so mtime records
   when a unit was last COMPILED, not when it was last USED. So this asks cargo
-  directly: it runs the builds YOU name, records the units they resolve to, and
-  deletes the rest.
+  directly: it runs your build (a no-op if the tree is warm), records the units
+  that build resolves to, and deletes the rest.
 
-  There is no default build. Nothing in a target dir records which command
-  filled it, so any default is a guess, and a guess that misses — other
-  features, a -p narrowing, another front end — compiles a whole config from
-  cold to mark units that were never here. Without --build nothing is compiled
-  and unit variants are left alone; the run still says what this tree has built,
-  to seed the list.
+  The default build is narrowed to what this tree can be shown to have built:
+  the target kinds in .fingerprint/, and the compile modes in deps/ — a tree an
+  editor only ever `cargo check`ed defaults to `cargo check`, not to a cold
+  `cargo build`. Anything with no units here has nothing to sweep, so compiling
+  it would mark nothing.
 
   Name every config you actually use, or the ones you leave out get deleted and
   cold-rebuild the next time you switch to them:
 
     cargo target-gc --apply --build 'cargo build' --build 'cargo clippy --all-targets'
 
-  A named build that starts compiling a REGISTRY dependency is a wrong guess by
-  definition, and stops the run rather than sitting through the cold build
-  (--allow-cold overrides). A crate of your own recompiling is just an edit, and
-  is what marking is for.
+  What no artifact records is which FEATURES built it, so that part cannot be
+  narrowed — and it is where a default goes wrong on a workspace whose real loop
+  is `--no-default-features -p foo`. So a mark command that starts compiling a
+  REGISTRY dependency is taken as proof it resolves a unit graph this tree does
+  not have: the run stops in seconds instead of sitting through the cold build,
+  and names what to pass to --build. (--allow-cold overrides.) A crate of your
+  own recompiling is just an edit, and is what marking is for.
 
 WHAT IT DELETES
   unit variants     every unit no named build resolves to
@@ -62,9 +64,9 @@ WHAT IT DELETES
                     versions Cargo.lock no longer resolves to
 
 EXAMPLES
-  cargo target-gc                       report; compile nothing, delete nothing
-  cargo target-gc --build 'cargo bf' --apply
-                                        mark that build, report, ask, delete
+  cargo target-gc                       report what would go, delete nothing
+  cargo target-gc --apply               report, then ask before deleting
+  cargo target-gc --no-build            report without running any build
   cargo target-gc --apply --yes         delete without asking (scripts, CI)
   cargo target-gc --budget 20G --apply  free cheapest-first until target/ fits
 ";
@@ -91,19 +93,18 @@ struct Cli {
     #[arg(long)]
     apply: bool,
 
-    /// A build whose units to keep, repeatable. Without one, nothing is
-    /// compiled and unit variants are left alone
+    /// A build whose units to keep, repeatable [default: the compile modes and
+    /// target kinds this tree has already built]
     #[arg(long, value_name = "CMD")]
     build: Vec<String>,
 
-    /// Say explicitly that no build is wanted: same as giving no --build, minus
-    /// the reminder to name one
+    /// Do not run any build: report and collect only what needs no live set
     #[arg(long, conflicts_with = "build")]
     no_build: bool,
 
-    /// Let a --build compile a registry dependency from cold instead of
+    /// Let a mark command compile a registry dependency from cold instead of
     /// stopping (it means that command is not a build this tree was made by)
-    #[arg(long, requires = "build")]
+    #[arg(long)]
     allow_cold: bool,
 
     /// Incremental cache dirs to keep per crate, or `all` to keep every one
@@ -138,8 +139,10 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // One `cargo metadata`, for where the target dir is: it honours
-    // CARGO_TARGET_DIR, build.target-dir and workspace inheritance.
+    // One `cargo metadata`: it answers both where the target dir is (honouring
+    // CARGO_TARGET_DIR, build.target-dir and workspace inheritance) and which
+    // targets are this workspace's own, which is what tells our artifacts in
+    // deps/ from a dependency's.
     let meta = cargo_metadata(&cli);
     let target_dir = resolve_target_dir(&cli, meta.as_ref())?;
     if !target_dir.is_dir() {
@@ -169,29 +172,34 @@ fn run(cli: Cli) -> Result<()> {
     // that is not a guess, and a guess that misses (other features, a `-p`
     // narrowing, another front end) is a cold compile of units this tree never
     // had. Without --build, the run is a report plus whatever needs no live set.
-    let live = if cli.build.is_empty() {
+    let live = if cli.no_build {
         let stored = marks::load(&target_dir);
-        if !cli.json {
-            if stored.is_empty() {
+        if stored.is_empty() {
+            if !cli.json {
                 eprintln!(
-                    "note: no --build given, so nothing was compiled and unit variants are \
-                     left alone"
+                    "note: --no-build and no live set on record, so unit variants are left \
+                     alone; run without --no-build to collect them"
                 );
-            } else {
+            }
+            None
+        } else {
+            if !cli.json {
                 eprintln!(
-                    "note: no --build given, so nothing was compiled — reusing the live set \
-                     from the last run ({} units); anything built since is at risk",
+                    "note: --no-build — reusing the live set from the last run ({} units); \
+                     anything built since is at risk",
                     stored.len()
                 );
             }
-            if !cli.no_build {
-                eprintln!("{}", suggestion(&profiles));
-            }
+            Some(stored)
         }
-        (!stored.is_empty()).then_some(stored)
     } else {
-        let cmds: Vec<Vec<String>> =
-            cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect();
+        let cmds: Vec<Vec<String>> = if cli.build.is_empty() {
+            let ws = workspace_targets(meta.as_ref());
+            let ws: Vec<(&str, bool)> = ws.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+            default_commands(&profiles, &ws, cli.json)
+        } else {
+            cli.build.iter().map(|c| c.split_whitespace().map(String::from).collect()).collect()
+        };
         Some(marks::mark(&target_dir, &cmds, cli.allow_cold, cli.json)?)
     };
 
@@ -327,40 +335,118 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// What to name on the command line, read off what this tree has already built.
+/// The workspace's own compilable targets, as (name, is_lib) -- the key that
+/// tells one of *our* artifacts in `deps/` from a dependency's.
 ///
-/// This is a suggestion and not a default: the fingerprints record which target
-/// *kinds* were built, which is enough to say "you have tests here" but not
-/// which features, packages or `--target` produced them -- and those are what
-/// decide the unit hashes. Only you know the command.
-fn suggestion(profiles: &[PathBuf]) -> String {
-    let mut kinds: Vec<&'static str> = Vec::new();
-    for k in profiles.iter().filter_map(|p| scan::built_kinds(p)).flatten() {
-        if !kinds.contains(&k) {
-            kinds.push(k);
+/// `cargo metadata --no-deps` lists exactly the workspace members, which is the
+/// set a bare `cargo build` here would select.
+fn workspace_targets(meta: Option<&serde_json::Value>) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let Some(pkgs) = meta.and_then(|m| m.get("packages")).and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for p in pkgs {
+        for t in p.get("targets").and_then(|t| t.as_array()).into_iter().flatten() {
+            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+            let kinds: Vec<&str> = t
+                .get("kind")
+                .and_then(|k| k.as_array())
+                .map(|a| a.iter().filter_map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            if kinds.iter().any(|k| {
+                matches!(*k, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro")
+            }) {
+                out.push((name.to_string(), true));
+            }
+            if kinds.iter().any(|k| *k == "bin") {
+                out.push((name.to_string(), false));
+            }
         }
     }
-    // One command per selection, because any target-selection flag *replaces*
-    // cargo's default selection: `cargo build --tests` builds the test
-    // harnesses and not the lib and bins. The bare run is what covers those,
-    // and it is the only spelling that does so without `--lib`, which fails
-    // outright on a workspace member that has no library target.
-    let mut cmds: Vec<String> = vec!["cargo build".into()];
-    cmds.extend(kinds.iter().map(|k| format!("cargo build {k}")));
-    // Check units are separate units with their own hashes, so no build command
-    // ever resolves to one: without `cargo check` named too, checking runs cold
-    // after a collection.
-    if profiles.iter().any(|p| scan::has_check_units(p)) {
-        cmds.push("cargo check".into());
+    out
+}
+
+/// The default mark commands: the compile modes and target kinds this tree can
+/// be shown to have built, and nothing beyond them.
+///
+/// Every command here has units in `deps/` waiting for it, so on a settled tree
+/// it is a freshness check. Widening it is what costs: `cargo build` on a tree
+/// only ever checked, or `--all-targets` on one that never benched, is a cold
+/// compile of a whole config paid to mark units that were never here.
+///
+/// Narrowing is safe in the direction that matters -- a mode or kind with no
+/// units has nothing for a sweep to delete -- with one exception: it cannot
+/// narrow past what the *features* were, which no artifact records. That is
+/// what mark's cold check is for.
+fn default_commands(profiles: &[PathBuf], ws: &[(&str, bool)], quiet: bool) -> Vec<Vec<String>> {
+    let read: Vec<Vec<&'static str>> = profiles.iter().filter_map(|p| scan::built_kinds(p)).collect();
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for k in read.iter().flatten() {
+        if !kinds.contains(k) {
+            kinds.push(*k);
+        }
     }
-    let named = cmds.iter().map(|c| format!("--build '{c}'")).collect::<Vec<_>>().join(" ");
-    format!(
-        "      this tree has built {}.\n\
-         \x20     Name the builds you actually run — your `[alias]`es, and whatever your\n\
-         \x20     editor compiles with — e.g.\n\
-         \x20       cargo target-gc {named}",
-        cmds.join(", ")
-    )
+    if read.is_empty() {
+        // Nothing could be read, so nothing can be ruled out.
+        kinds = vec!["--all-targets"];
+    } else if !quiet {
+        let skipped: Vec<&str> = ["--tests", "--examples", "--benches"]
+            .into_iter()
+            .filter(|f| !kinds.contains(f))
+            .collect();
+        if !skipped.is_empty() {
+            eprintln!(
+                "note: this tree has never built {}, so the default marks skip them",
+                skipped.join(" ")
+            );
+        }
+    }
+
+    let mut modes = scan::Modes::default();
+    for p in profiles {
+        let m = scan::built_modes(p, ws);
+        modes.build |= m.build;
+        modes.check |= m.check;
+    }
+    // Neither seen means no unit of ours was found at all -- an unreadable or
+    // foreign-shaped tree, where concluding "never built" would skip a build
+    // whose units are here and get them swept.
+    if !modes.build && !modes.check {
+        modes.build = true;
+    }
+
+    // One command per selection rather than one command carrying them all,
+    // because any target-selection flag *replaces* cargo's default selection:
+    // `cargo build --tests` builds the test harnesses and not the lib and bins.
+    // The bare run is what covers those, and it is the only spelling that does
+    // so without `--lib`, which fails outright on a workspace member that has no
+    // library target. Each extra run is a freshness check on a warm tree.
+    let sel = |base: &str| -> Vec<Vec<String>> {
+        let mut out = vec![vec!["cargo".into(), base.to_string()]];
+        out.extend(kinds.iter().map(|f| vec!["cargo".into(), base.to_string(), f.to_string()]));
+        out
+    };
+    let mut cmds = Vec::new();
+    if modes.build {
+        cmds.extend(sel("build"));
+    }
+    // Check units are separate units with their own hashes, so a build command
+    // never resolves to them -- and on a tree an editor drives, they can be the
+    // only units there are.
+    if modes.check {
+        cmds.extend(sel("check"));
+    }
+    if !quiet {
+        match (modes.build, modes.check) {
+            (true, true) => eprintln!("note: this tree has `cargo check` units, so they are marked too"),
+            (false, true) => eprintln!(
+                "note: this tree has only `cargo check` units — nothing here was ever built, \
+                 so the default marks skip `cargo build`"
+            ),
+            _ => {}
+        }
+    }
+    cmds
 }
 
 /// Ask before deleting. Off a terminal there is nobody to ask, and guessing
@@ -494,28 +580,55 @@ fn parse_size(s: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_size, suggestion};
+    use super::{default_commands, parse_size};
     use crate::scan::{stem, unit_hash};
     use std::fs;
     use std::path::PathBuf;
 
-    /// The suggestion names what the fingerprints prove was built, and never a
-    /// kind the tree has no units for -- suggesting `--benches` on a tree that
-    /// never benched is how you talk someone into a cold compile.
-    #[test]
-    fn the_suggestion_is_only_what_this_tree_has_built() {
+    /// A profile dir holding one `deps/` listing and an (empty) `.fingerprint/`,
+    /// so `built_kinds` reads it rather than concluding nothing.
+    fn fixture(tag: &str, deps: &[&str]) -> PathBuf {
         let root = std::env::temp_dir()
-            .join(format!("cargo-target-gc-suggest-{}", std::process::id()))
+            .join(format!("cargo-target-gc-defaults-{}-{tag}", std::process::id()))
             .join("debug");
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("deps")).unwrap();
+        fs::create_dir_all(root.join(".fingerprint")).unwrap();
+        for f in deps {
+            fs::write(root.join("deps").join(f), b"x").unwrap();
+        }
+        root
+    }
+
+    /// The tree an editor made: `cargo check` and nothing else. Defaulting to
+    /// `cargo build` here compiles the whole workspace from cold to mark units
+    /// that do not exist -- and every check unit that does exist stays unmarked
+    /// while it does so.
+    #[test]
+    fn a_checked_only_tree_defaults_to_checking() {
+        let root = fixture("checked", &["libwapp-1111111111111111.rmeta", "wapp-1111111111111111.d"]);
+        let cmds = default_commands(&[root], &[("wapp", true)], true);
+        assert_eq!(cmds, vec![vec!["cargo", "check"]]);
+    }
+
+    #[test]
+    fn a_built_tree_defaults_to_building_the_kinds_it_has() {
+        let root = fixture("built", &["libwapp-1111111111111111.rlib"]);
         fs::create_dir_all(root.join(".fingerprint/wapp-2222222222222222")).unwrap();
         fs::write(root.join(".fingerprint/wapp-2222222222222222/test-bin-wapp"), b"x").unwrap();
-        let s = suggestion(&[PathBuf::from(&root)]);
-        assert!(s.contains("--build 'cargo build' --build 'cargo build --tests'"), "{s}");
-        assert!(!s.contains("--benches"), "{s}");
-        assert!(!s.contains("--examples"), "{s}");
-        // no deps/ here, so no check units to name either
-        assert!(!s.contains("cargo check"), "{s}");
+        let cmds = default_commands(&[root], &[("wapp", true)], true);
+        assert_eq!(cmds, vec![vec!["cargo", "build"], vec!["cargo", "build", "--tests"]]);
+        // never a kind this tree has no units for
+        assert!(!format!("{cmds:?}").contains("--benches"));
+    }
+
+    /// A tree whose units cannot be attributed to this workspace at all: the
+    /// safe answer is the plain build, since skipping it would sweep whatever
+    /// is live here.
+    #[test]
+    fn an_unreadable_tree_still_builds() {
+        let root = fixture("foreign", &["libserde-5555555555555555.rlib"]);
+        assert_eq!(default_commands(&[root], &[("wapp", true)], true), vec![vec!["cargo", "build"]]);
     }
 
     #[test]

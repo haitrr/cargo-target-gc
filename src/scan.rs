@@ -105,30 +105,71 @@ pub fn hashless_lib_targets(profile_dir: &Path) -> HashSet<String> {
     out
 }
 
-/// True if this profile holds `cargo check` units.
+/// Whether this profile holds build units, check units, or both -- asked about
+/// *this workspace's own* targets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Modes {
+    pub build: bool,
+    pub check: bool,
+}
+
+/// Which compile modes this tree has actually run, read off `deps/`.
 ///
-/// A check unit emits metadata only, so it appears in `deps/` as
-/// `<name>-<hash>.rmeta` with no `.rlib`/`.dylib` beside it -- and it is a
-/// *different unit* from the build unit of the same crate, with its own hash.
-/// A build command therefore never resolves to one, so unless `cargo check` is
-/// named too, checking runs cold after a collection. (Proc-macro units emit a
-/// dylib, so they are not mistaken for check units.)
-pub fn has_check_units(profile_dir: &Path) -> bool {
-    let mut exts: HashMap<String, (bool, bool)> = HashMap::new();
-    let Ok(rd) = fs::read_dir(profile_dir.join("deps")) else { return false };
+/// A check unit emits metadata only, so it appears as `<name>-<hash>.rmeta`
+/// with no `.rlib`/`.dylib` beside it -- and it is a *different unit* from the
+/// build unit of the same crate, with its own hash. Neither command's units are
+/// reachable from the other, so each mode has to be marked by the matching
+/// command, and running a mode this tree has never used is a cold compile paid
+/// to mark nothing. That is the whole question here.
+///
+/// It is asked only about the workspace's own targets, because a dependency
+/// answers it wrong in both directions: `cargo check` compiles build-script
+/// dependencies for real (they have to run), so a checked-only tree is full of
+/// registry `.rlib`s, and a built tree still carries `.rmeta` for every
+/// dependency whose rlib was pipelined. What settles it is whether *your* lib
+/// was linked or only metadata-checked.
+///
+/// A profile with no unit of ours at all concludes nothing -- both false --
+/// rather than "never built": that is the shape of a tree this run could not
+/// read, and skipping the default build on it would leave live units unmarked.
+pub fn built_modes(profile_dir: &Path, ws_targets: &[(&str, bool)]) -> Modes {
+    let mut ours: HashSet<String> = HashSet::new();
+    for (name, is_lib) in ws_targets {
+        let under = name.replace('-', "_");
+        if *is_lib {
+            // a lib artifact is `lib<crate_name>`, always with underscores
+            ours.insert(format!("lib{under}"));
+            ours.insert(under);
+        } else {
+            // a bin keeps the target name as written, dashes and all
+            ours.insert(name.to_string());
+            ours.insert(under);
+        }
+    }
+
+    let mut units: HashMap<String, (bool, bool)> = HashMap::new();
+    let Ok(rd) = fs::read_dir(profile_dir.join("deps")) else { return Modes::default() };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let st = stem(&name);
         let Some(h) = unit_hash(st) else { continue };
-        let ext = name[st.len()..].trim_start_matches('.').to_string();
-        let entry = exts.entry(h.to_string()).or_insert((false, false));
-        match ext.as_str() {
-            "rmeta" => entry.0 = true,
-            "rlib" | "dylib" | "so" | "dll" | "a" | "lib" => entry.1 = true,
+        if !ours.contains(&st[..st.len() - 17]) {
+            continue;
+        }
+        let ext = name[st.len()..].trim_start_matches('.');
+        let u = units.entry(h.to_string()).or_insert((false, false));
+        match ext {
+            "rmeta" => u.0 = true,
+            // no extension at all is a bin: linked, and the clearest proof of a
+            // real build there is
+            "rlib" | "dylib" | "so" | "dll" | "a" | "lib" | "" => u.1 = true,
             _ => {}
         }
     }
-    exts.values().any(|(rmeta, linked)| *rmeta && !*linked)
+    Modes {
+        build: units.values().any(|(_, linked)| *linked),
+        check: units.values().any(|(rmeta, linked)| *rmeta && !*linked),
+    }
 }
 
 /// The extra `cargo build` target-selection flags this profile needs on top of
@@ -368,5 +409,81 @@ mod tests {
         // ...so only the exemption keeps it from being collected
         let other = root.join(".fingerprint/wlib-ea73957bd44e0bd0");
         assert!(!fingerprint_is_hashless_lib(&other, &hashless));
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    /// deps/ for a workspace whose own crates were only ever `cargo check`ed:
+    /// its lib is rmeta-only. Build-script dependencies are still compiled for
+    /// real by a check -- they have to run -- so rlibs exist here regardless,
+    /// which is why the question is asked about *this workspace's* targets and
+    /// not about the profile as a whole.
+    fn deps_fixture(tag: &str, files: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("cargo-target-gc-modes-{}-{tag}", std::process::id()))
+            .join("debug");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("deps")).unwrap();
+        for f in files {
+            fs::write(root.join("deps").join(f), b"x").unwrap();
+        }
+        root
+    }
+
+    const WS: [(&str, bool); 2] = [("wapp", true), ("wapp", false)];
+
+    #[test]
+    fn a_checked_workspace_is_not_a_built_one() {
+        let root = deps_fixture(
+            "checked",
+            &[
+                "libwapp-1111111111111111.rmeta",
+                "wapp-1111111111111111.d",
+                // a build script's own dependency, compiled for real by a check
+                "libautocfg-2222222222222222.rlib",
+                "libautocfg-2222222222222222.rmeta",
+            ],
+        );
+        assert_eq!(built_modes(&root, &WS), Modes { build: false, check: true });
+    }
+
+    #[test]
+    fn a_built_workspace_reports_a_build() {
+        let root = deps_fixture(
+            "built",
+            &["libwapp-1111111111111111.rlib", "libwapp-1111111111111111.rmeta"],
+        );
+        assert_eq!(built_modes(&root, &WS), Modes { build: true, check: false });
+    }
+
+    #[test]
+    fn a_bin_target_carries_no_extension() {
+        let root = deps_fixture("bin", &["wapp-3333333333333333", "wapp-3333333333333333.d"]);
+        assert_eq!(built_modes(&root, &WS), Modes { build: true, check: false });
+    }
+
+    /// Both, which is the normal state of a tree with an editor on it.
+    #[test]
+    fn a_tree_can_hold_both_modes() {
+        let root = deps_fixture(
+            "both",
+            &[
+                "libwapp-1111111111111111.rlib",
+                "libwapp-1111111111111111.rmeta",
+                "libwapp-4444444444444444.rmeta",
+            ],
+        );
+        assert_eq!(built_modes(&root, &WS), Modes { build: true, check: true });
+    }
+
+    /// Nothing of ours here at all: concluding "never built" would skip the
+    /// default build on a tree that simply could not be read.
+    #[test]
+    fn no_workspace_units_concludes_nothing() {
+        let root = deps_fixture("empty", &["libserde-5555555555555555.rlib"]);
+        assert_eq!(built_modes(&root, &WS), Modes { build: false, check: false });
     }
 }

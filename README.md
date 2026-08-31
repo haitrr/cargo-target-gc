@@ -24,14 +24,42 @@ Then there are two commands:
 
 ```sh
 cargo target-gc            # report what would go, delete nothing
-cargo target-gc --apply    # delete it (unit variants need --build, below)
+cargo target-gc --apply    # delete it
 ```
 
-`cargo target-gc` on its own compiles nothing: it reports, and collects only the
-categories that need no live set (dead incremental sessions, orphans, stale
-dependency versions). To collect *unit variants* — usually the biggest line — it
-has to know which units are live, and the only way to know is to run the builds
-you actually use:
+Both run your builds first (a freshness check on a warm tree), record the units
+they resolve to, and treat everything else as garbage.
+
+The default is narrowed to what this tree can be **shown** to have built, so a
+collection never turns into a cold compile:
+
+* the target kinds in `.fingerprint/` — never built benches means no
+  `--benches`;
+* the compile modes in `deps/`, judged on *your own* crates — a tree an editor
+  only ever `cargo check`ed defaults to `cargo check`, not to a full cold
+  `cargo build`. (Check units are separate units with their own hashes, so no
+  build command ever resolves to one; and `cargo check` compiles build-script
+  dependencies for real, which is why the question is asked about your targets
+  and not about the profile as a whole.)
+
+What no artifact records is which **features** produced it — so that part cannot
+be narrowed, and it is exactly where a default goes wrong on a workspace whose
+real inner loop is an alias like `build --no-default-features -p oxy-server`. So
+a mark command that starts compiling a **registry dependency** is taken as proof
+it resolves a unit graph this tree does not have, and the run stops within
+seconds instead of sitting through it:
+
+```
+error: `cargo build --release` is cold in this tree — it started compiling
+unicode-ident, a registry dependency, so this is not a build this target/ was
+made by. Nothing was deleted.
+```
+
+`--allow-cold` sits through it anyway. A crate of your own recompiling is just
+an edit you made, and is what marking is for.
+
+Name every config you actually use — anything you leave out is deleted and
+cold-rebuilds when you next switch to it:
 
 ```sh
 cargo target-gc --apply \
@@ -40,36 +68,12 @@ cargo target-gc --apply \
   --build 'cargo clippy --all-targets'
 ```
 
-There is no default build, on purpose. Nothing in a target dir records which
-command filled it — the unit hashes depend on features, packages, RUSTFLAGS and
-`--target`, none of which are recoverable from the tree — so any default is a
-guess, and a guess that misses compiles a whole config from cold to mark units
-that were never there. A run with no `--build` prints the target *kinds* the
-tree has built (`--tests`, `--examples`, a `cargo check`) as a starting point;
-turning those into commands is yours, because only you know your `[alias]`es and
-what your editor compiles with.
+Anything driven by another compiler front end is invisible to the default and
+needs naming explicitly — `--build 'cargo clippy --all-targets'`, and whatever
+your editor runs if it shares this target dir.
 
-Name every config you use — anything you leave out is deleted and cold-rebuilds
-when you next switch to it. `cargo check` in particular: a check unit emits
-metadata only and is a *different unit* with its own hash, so no build command
-ever resolves to one.
-
-If a named build starts compiling a **registry dependency**, that command is not
-one this tree was made by — registry crates are settled, so one going cold means
-a different unit graph — and the run stops within seconds instead of sitting
-through the cold build:
-
-```
-error: `cargo build --release` is cold in this tree — it started compiling
-unicode-ident, a registry dependency, so this is not a build this target/ was
-made by. Nothing was deleted.
-```
-
-`--allow-cold` sits through it anyway. A crate of your own recompiling is just an
-edit you made, and is exactly what marking is for.
-
-Other flags: `--no-build` (says explicitly that no build is wanted, silencing
-the reminder to name one), `--keep-incremental N|all`, `--budget 20G`,
+Other flags: `--no-build` (report without running anything, and then only
+collect what needs no live set), `--keep-incremental N|all`, `--budget 20G`,
 `--json`, `--target-dir`, `--manifest-path`.
 
 It works in any workspace: the target dir comes from `cargo metadata`, so
