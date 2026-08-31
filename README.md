@@ -24,13 +24,14 @@ Then there are two commands:
 
 ```sh
 cargo target-gc            # report what would go, delete nothing
-cargo target-gc --apply    # delete it
+cargo target-gc --apply    # delete it (unit variants need --build, below)
 ```
 
-Both run your build first (a freshness check on a warm tree), record the units
-it resolves to, and treat everything else as garbage. Name every config you
-actually use — anything you leave out is deleted and cold-rebuilds when you next
-switch to it:
+`cargo target-gc` on its own compiles nothing: it reports, and collects only the
+categories that need no live set (dead incremental sessions, orphans, stale
+dependency versions). To collect *unit variants* — usually the biggest line — it
+has to know which units are live, and the only way to know is to run the builds
+you actually use:
 
 ```sh
 cargo target-gc --apply \
@@ -39,21 +40,36 @@ cargo target-gc --apply \
   --build 'cargo clippy --all-targets'
 ```
 
-The default is `cargo build --all-targets`, which covers lib, bins, tests,
-examples and benches for your default features, plus `cargo check --all-targets`
-when the tree already contains check units. That second one matters: a check unit
-emits metadata only and is a *different unit* with its own hash, so a build
-command never resolves to one — without it, `cargo check` runs cold after a
-collection. It is only added when such units already exist, so the default never
-compiles metadata nobody asked for.
+There is no default build, on purpose. Nothing in a target dir records which
+command filled it — the unit hashes depend on features, packages, RUSTFLAGS and
+`--target`, none of which are recoverable from the tree — so any default is a
+guess, and a guess that misses compiles a whole config from cold to mark units
+that were never there. A run with no `--build` prints the target *kinds* the
+tree has built (`--tests`, `--examples`, a `cargo check`) as a starting point;
+turning those into commands is yours, because only you know your `[alias]`es and
+what your editor compiles with.
 
-Anything driven by another compiler front-end is invisible to both and needs
-naming explicitly — `--build 'cargo clippy --all-targets'`, and whatever your
-editor runs if it shares this target dir. Note that on a tree where tests were
-never built, the first run compiles them.
+Name every config you use — anything you leave out is deleted and cold-rebuilds
+when you next switch to it. `cargo check` in particular: a check unit emits
+metadata only and is a *different unit* with its own hash, so no build command
+ever resolves to one.
 
-Other flags: `--no-build` reports without running anything (and then only
-collects what needs no live set), `--keep-incremental N|all`, `--budget 20G`,
+If a named build starts compiling a **registry dependency**, that command is not
+one this tree was made by — registry crates are settled, so one going cold means
+a different unit graph — and the run stops within seconds instead of sitting
+through the cold build:
+
+```
+error: `cargo build --release` is cold in this tree — it started compiling
+unicode-ident, a registry dependency, so this is not a build this target/ was
+made by. Nothing was deleted.
+```
+
+`--allow-cold` sits through it anyway. A crate of your own recompiling is just an
+edit you made, and is exactly what marking is for.
+
+Other flags: `--no-build` (says explicitly that no build is wanted, silencing
+the reminder to name one), `--keep-incremental N|all`, `--budget 20G`,
 `--json`, `--target-dir`, `--manifest-path`.
 
 It works in any workspace: the target dir comes from `cargo metadata`, so

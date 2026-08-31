@@ -239,12 +239,17 @@ impl DepsIndex {
 /// Run each command with `--message-format=json` and record the unit hashes it
 /// resolves to.
 ///
-/// Marks accumulate across runs and are unioned, so marking after each config
-/// you actually use (`cargo build`, `cargo test --no-run`, your
-/// `--no-default-features` variants) builds up a live set covering all of them.
-/// A command that has to compile something is not wrong, just slow -- it means
-/// that config was not settled, and its artifacts are now marked either way.
-pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<Marks> {
+/// Every command here is one you named: there is no default build, because
+/// nothing in a target dir records which command filled it, and a wrong guess
+/// is a cold compile of a config whose units were never there. So a cold
+/// command is treated as a mistake -- see `cold_foreign_compile` -- and
+/// `allow_cold` is what it takes to sit through one deliberately.
+pub fn mark(
+    target_dir: &Path,
+    commands: &[Vec<String>],
+    allow_cold: bool,
+    quiet: bool,
+) -> Result<Marks> {
     if !quiet {
         eprintln!("  index: reading unit hashes from {}", target_dir.display());
     }
@@ -272,9 +277,16 @@ pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<
 
         let mut found = 0usize;
         let mut unresolved: Vec<String> = Vec::new();
+        let mut cold: Option<String> = None;
         if let Some(out) = child.stdout.take() {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                if !allow_cold {
+                    if let Some(pkg) = cold_foreign_compile(&msg) {
+                        cold = Some(pkg);
+                        break;
+                    }
+                }
                 let mut paths: Vec<String> = Vec::new();
                 match msg.get("reason").and_then(|r| r.as_str()) {
                     Some("compiler-artifact") => {
@@ -307,6 +319,19 @@ pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<
                 }
             }
         }
+        if let Some(pkg) = cold {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "`{}` is cold in this tree — it started compiling {pkg}, a registry \
+                 dependency, so this is not a build this target/ was made by. Nothing was \
+                 deleted.\n  Name the builds you actually run (check your `[alias]`es and \
+                 what your editor runs), e.g.\n    cargo target-gc --build 'cargo build \
+                 --no-default-features -p foo'\n  or pass --allow-cold to sit through the \
+                 cold build and mark it anyway.",
+                cmd.join(" ")
+            );
+        }
         let status = child.wait()?;
         if !status.success() {
             // Sweeping on a partial live set deletes units that are in use, so a
@@ -334,4 +359,101 @@ pub fn mark(target_dir: &Path, commands: &[Vec<String>], quiet: bool) -> Result<
 
     save(target_dir, &marks)?;
     Ok(marks)
+}
+
+/// The package name when this message is a registry dependency that cargo just
+/// compiled, rather than found fresh.
+///
+/// This is the signal that a mark command is not the build this tree was made
+/// by. A crate you wrote compiling is the normal case — you edited it since the
+/// last build, and marking exists to pick that up. A crate out of the registry
+/// or a git checkout compiling is not: those are settled by construction, so one
+/// going cold means this command resolved a different unit graph (other
+/// features, other RUSTFLAGS, another `--target`) than anything in `deps/`.
+/// Continuing would be a full cold build paid to mark units that were never
+/// here.
+///
+/// The test is the cargo cache path rather than "outside the workspace root",
+/// because a path dependency in a sibling directory is yours too — you edit it,
+/// it recompiles, and that must not read as a wrong config.
+pub fn cold_foreign_compile(msg: &serde_json::Value) -> Option<String> {
+    if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+        return None;
+    }
+    if msg.get("fresh").and_then(|f| f.as_bool()) != Some(false) {
+        return None;
+    }
+    let manifest = msg.get("manifest_path").and_then(|m| m.as_str())?;
+    if !is_cached_dep(manifest) {
+        return None;
+    }
+    let id = msg.get("package_id").and_then(|p| p.as_str()).unwrap_or("");
+    Some(pkg_label(id, manifest))
+}
+
+/// True for a manifest under cargo's own caches: `$CARGO_HOME/registry/src/…`
+/// or `$CARGO_HOME/git/checkouts/…`, wherever CARGO_HOME points.
+fn is_cached_dep(manifest: &str) -> bool {
+    let p = manifest.replace('\\', "/");
+    p.contains("/registry/src/") || p.contains("/git/checkouts/")
+}
+
+/// A package id as a person writes it. Cargo has two spellings:
+/// `registry+<url>#proc-macro2@1.0.106` today, `proc-macro2 1.0.106 (registry+…)`
+/// before that; the manifest's directory is the fallback for anything else.
+fn pkg_label(id: &str, manifest: &str) -> String {
+    if let Some(tail) = id.rsplit('#').next() {
+        if let Some((name, _ver)) = tail.rsplit_once('@') {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    if let Some(first) = id.split_whitespace().next() {
+        if !first.is_empty() && !first.contains("://") {
+            return first.to_string();
+        }
+    }
+    Path::new(manifest)
+        .parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "a dependency".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(id: &str, manifest: &str, fresh: bool) -> serde_json::Value {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": id,
+            "manifest_path": manifest,
+            "fresh": fresh,
+        })
+    }
+
+    const REG: &str = "/home/u/.cargo/registry/src/index.crates.io-1949/proc-macro2-1.0.106/Cargo.toml";
+
+    #[test]
+    fn a_cold_registry_dep_means_the_command_is_the_wrong_one() {
+        let id = "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.106";
+        assert_eq!(cold_foreign_compile(&artifact(id, REG, false)), Some("proc-macro2".into()));
+        // the pre-2024 spelling of the same id
+        let old = "proc-macro2 1.0.106 (registry+https://github.com/rust-lang/crates.io-index)";
+        assert_eq!(cold_foreign_compile(&artifact(old, REG, false)), Some("proc-macro2".into()));
+    }
+
+    #[test]
+    fn a_fresh_dep_or_an_edited_crate_of_yours_is_not_a_cold_config() {
+        let id = "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.106";
+        assert_eq!(cold_foreign_compile(&artifact(id, REG, true)), None);
+        // you edited it since the last build; marking exists to pick that up
+        let mine = "path+file:///ws/crates/myapp#0.1.0";
+        assert_eq!(cold_foreign_compile(&artifact(mine, "/ws/crates/myapp/Cargo.toml", false)), None);
+        // a path dependency you keep next door is yours as well
+        let nb = "path+file:///elsewhere/shared#0.1.0";
+        assert_eq!(cold_foreign_compile(&artifact(nb, "/elsewhere/shared/Cargo.toml", false)), None);
+    }
 }
